@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 2 章 · Hello CUDA</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head>
+<body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol>
+        <li><a href="../ch01-intro/index.html">导论与环境</a></li>
+        <li><a href="../ch02-hello/index.html" class="current">Hello CUDA</a></li>
+        <li><a href="../ch03-threads/index.html">线程模型与索引</a></li>
+        <li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li>
+      </ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5">
+        <li><a href="../ch05-memory/index.html">内存层级</a></li>
+        <li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li>
+        <li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li>
+        <li><a href="../ch08-async/index.html">性能分析与异步</a></li>
+      </ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9">
+        <li><a href="../ch09-gemm/index.html">GEMM 深入</a></li>
+        <li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li>
+        <li><a href="../ch11-attention/index.html">Attention 入门</a></li>
+        <li><a href="../ch12-flashattn/index.html">FlashAttention</a></li>
+        <li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li>
+        <li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li>
+      </ol>
+      <div class="stage">附录</div>
+      <ol style="counter-reset: ch -1">
+        <li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 2 章 · Hello CUDA</h1>
+    <div class="chapter-meta">
+      <span>⏱️ 预计 40 分钟</span>
+      <span>🎯 写出第一个 kernel</span>
+      <span>📂 code/ch02_hello/</span>
+    </div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>写出第一个 <code>__global__</code> kernel，理解 host 与 device 的分工</li>
+      <li>掌握 <code>&lt;&lt;&lt;grid, block&gt;&gt;&gt;</code> 启动语法</li>
+      <li>用 <code>cudaMalloc / cudaMemcpy / cudaFree</code> 三件套搬数据</li>
+      <li>明白为什么<strong>每个 CUDA 调用都必须检查返回码</strong>，错误检查宏怎么写</li>
+    </ul>
+
+    <h2>前置知识</h2>
+    <p>第 1 章环境已搭好，能编译 C++ 程序。</p>
+
+    <h2 id="hello">2.1 host vs device 心智模型</h2>
+    <p>CUDA 程序里有两个执行世界：</p>
+<pre class="mermaid">
+graph LR
+    H["host = CPU<br/>跑 main()<br/>分配 / 准备数据"] -- cudaMemcpy --> D["device = GPU<br/>跑 kernel<br/>巨量并行计算"]
+    D -- cudaMemcpy --> H
+    style H fill:#f6f8fa,stroke:#0969da
+    style D fill:#f6f8fa,stroke:#1a7f37
+</pre>
+
+    <p>函数靠修饰符区分：</p>
+    <table>
+      <tr><th>修饰符</th><th>谁调用</th><th>谁执行</th><th>例</th></tr>
+      <tr><td><code>__host__</code> (默认)</td><td>host</td><td>host</td><td><code>int main()</code></td></tr>
+      <tr><td><code>__global__</code></td><td>host</td><td>device</td><td>kernel：<code>add&lt;&lt;&lt;...&gt;&gt;&gt;(...)</code></td></tr>
+      <tr><td><code>__device__</code></td><td>device</td><td>device</td><td>kernel 内调用的辅助函数</td></tr>
+      <tr><td><code>__host__ __device__</code></td><td>都行</td><td>都行</td><td>共享代码，如 sigmoid 公式</td></tr>
+    </table>
+
+    <h2>2.2 第一个 kernel: hello.cu</h2>
+    <p>源码：<a href="../../code/ch02_hello/hello.cu">hello.cu</a>。</p>
+<pre><code class="language-cpp">__global__ void hello_kernel() {
+    printf("hello from thread (%d, %d) of block (%d, %d)\n",
+           threadIdx.x, threadIdx.y,
+           blockIdx.x,  blockIdx.y);
+}
+
+int main() {
+    hello_kernel&lt;&lt;&lt;2, 4&gt;&gt;&gt;();   // 2 blocks × 4 threads = 8 lines
+    KERNEL_CHECK();              // 等 kernel 跑完
+}</code></pre>
+
+    <h3>启动语法 <code>&lt;&lt;&lt;...&gt;&gt;&gt;</code> 拆解</h3>
+<pre><code class="language-cpp">kernel&lt;&lt;&lt;grid_dim, block_dim, shared_bytes, stream&gt;&gt;&gt;(args);
+//      ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^
+//      启动几个 block       每个 block 几个 thread
+//                                     可选：动态 shared mem 大小
+//                                                 可选：在哪个 stream 上</code></pre>
+    <ul>
+      <li><strong>grid_dim, block_dim</strong>：可以是 <code>int</code>（一维）或 <code>dim3(x,y,z)</code>（最多三维）。每维上限：block 内总线程 ≤ 1024。</li>
+      <li><strong>kernel 内可见的内置变量</strong>：<code>threadIdx.{x,y,z}</code> (本 block 内的线程号), <code>blockIdx.{x,y,z}</code> (本 grid 内的 block 号), <code>blockDim</code>, <code>gridDim</code>。</li>
+    </ul>
+
+    <div class="callout warn">
+      <strong>常见坑：</strong> kernel 启动是<strong>异步</strong>的——<code>kernel&lt;&lt;&lt;...&gt;&gt;&gt;()</code> 调用立即返回，GPU 在后台跑。如果你不 <code>cudaDeviceSynchronize()</code> 就读结果，会读到旧值。<code>KERNEL_CHECK()</code> 宏里内置了 sync，所以教学代码中无脑加它。
+    </div>
+
+    <h2 id="memcpy">2.3 数据搬运: host_device_memcpy.cu</h2>
+    <p>CUDA 上一切数据都活在显存里——你必须显式拷过去、再拷回来。</p>
+
+<pre><code class="language-cpp">// 流程: 分配 → 拷入 → 计算 → 拷回 → 释放
+
+float* d = nullptr;
+CUDA_CHECK(cudaMalloc(&amp;d, N * sizeof(float)));           // 1. 分配显存
+CUDA_CHECK(cudaMemcpy(d, h, N*sizeof(float), cudaMemcpyHostToDevice));  // 2. H2D
+
+scale_kernel&lt;&lt;&lt;1, N&gt;&gt;&gt;(d, 3.14f, N);                     // 3. 计算
+KERNEL_CHECK();
+
+CUDA_CHECK(cudaMemcpy(h, d, N*sizeof(float), cudaMemcpyDeviceToHost));  // 4. D2H
+CUDA_CHECK(cudaFree(d));                                  // 5. 释放</code></pre>
+
+    <p>本仓库提供了 RAII 封装 <code>DeviceBuffer&lt;T&gt;</code>（见 <a href="../../code/common/cuda_utils.h">common/cuda_utils.h</a>），少写一半代码：</p>
+<pre><code class="language-cpp">DeviceBuffer&lt;float&gt; d(N);          // 析构时自动 free
+d.copy_from_host(h);
+scale_kernel&lt;&lt;&lt;1, N&gt;&gt;&gt;(d.ptr, 3.14f, N);
+KERNEL_CHECK();
+d.copy_to_host(h);</code></pre>
+
+    <h2 id="errors">2.4 错误检查的三道关</h2>
+    <p>CUDA 不像 C++ 抛异常——所有 API 都返回 <code>cudaError_t</code>，你不查就吞掉。错误源有三类：</p>
+
+    <table>
+      <tr><th>错误类型</th><th>谁返回</th><th>例</th></tr>
+      <tr><td>显式 API 失败</td><td>API 调用本身</td><td>cudaMalloc OOM、参数非法</td></tr>
+      <tr><td>启动配置错误</td><td>cudaPeekAtLastError 或下次 sync</td><td>block 超 1024 线程</td></tr>
+      <tr><td>kernel 运行时错误</td><td>cudaDeviceSynchronize 时返回</td><td>越界访问、misaligned load</td></tr>
+    </table>
+
+    <p>所以仓库里的两个宏（<a href="../../code/common/cuda_utils.h">common/cuda_utils.h</a>）：</p>
+<pre><code class="language-cpp">#define CUDA_CHECK(stmt)  do {                            \
+    cudaError_t _e = (stmt);                              \
+    if (_e != cudaSuccess) {                              \
+        fprintf(stderr, "[CUDA] %s:%d: %s -&gt; %s\n",       \
+                __FILE__, __LINE__, #stmt,                \
+                cudaGetErrorString(_e));                  \
+        exit(1);                                          \
+    }                                                     \
+} while (0)
+
+#define KERNEL_CHECK() do {                               \
+    CUDA_CHECK(cudaPeekAtLastError());                    \
+    CUDA_CHECK(cudaDeviceSynchronize());                  \
+} while (0)</code></pre>
+
+    <p><code>error_handling.cu</code> 演示三种错误如何被这两个宏抓住，强烈建议自己跑一遍看输出。</p>
+
+    <div class="callout danger">
+      <strong>Sticky error：</strong> CUDA 错误一旦发生，后续所有调用都会复读同一个错。
+      处理完后用 <code>cudaGetLastError()</code> 主动清掉，否则后面所有 API 都"莫名其妙地失败"。
+    </div>
+
+    <h2>2.5 自检清单</h2>
+    <details>
+      <summary>Q1: <code>__global__</code> 函数能 return 值吗？</summary>
+      <p>不能——返回类型必须是 <code>void</code>。把结果写到传入的指针指向的 device 内存里。</p>
+    </details>
+    <details>
+      <summary>Q2: kernel 内能 <code>printf</code> 吗？性能怎么样？</summary>
+      <p>能（计算能力 ≥ 2.0）。底层有一个固定大小的 device-side 缓冲区，调试用足够，但生产 kernel 千万别留 printf——它会大幅拖慢吞吐。</p>
+    </details>
+    <details>
+      <summary>Q3: <code>cudaMemcpy</code> 是阻塞的吗？</summary>
+      <p>默认阻塞 host（直到完成才返回）。<code>cudaMemcpyAsync</code> 是异步版本，必须配 stream，第 8 章会讲。</p>
+    </details>
+    <details>
+      <summary>Q4: 我能在 host 代码里 <code>p[0] = 5</code> 写一个 cudaMalloc 出来的指针吗？</summary>
+      <p><strong>不能。</strong>那是 device 指针，host 直接解引用会段错误。必须走 cudaMemcpy。例外是 unified / managed memory（<code>cudaMallocManaged</code>），但教学代码里我们坚持显式管理以让你看清数据流。</p>
+    </details>
+    <details>
+      <summary>Q5: 一次 kernel 启动最多多少个线程？</summary>
+      <p>每 block ≤ 1024 thread；grid 维度上限 ~2³¹ × 65535 × 65535。所以总数巨大（万亿级别）。但驻留 SM 的 warp 数受硬件 occupancy 限制，多余的等候调度。</p>
+    </details>
+
+    <h2>2.6 练习</h2>
+    <ol>
+      <li>补全 <a href="../../code/ch02_hello/exercises/01_axpy_starter.cu">exercises/01_axpy_starter.cu</a> 中的 SAXPY kernel：<code>y = a*x + y</code>，<code>N = 1M</code>，与 CPU 版对拍。</li>
+      <li>修改 <code>error_handling.cu</code>，在 <code>bad_kernel</code> 里写 <code>*(int*)0 = 0</code>（空指针解引用），观察 <code>cudaDeviceSynchronize</code> 的报错。</li>
+      <li>把 <code>scale_kernel</code> 改成 <code>fma_kernel</code>：<code>z[i] = x[i] * y[i] + bias</code>。这是后面 MLP 的基本块。</li>
+    </ol>
+
+    <h2 id="industry">2.7 工业实战：CUDA 调试工作流</h2>
+
+    <p>教程里 <code>printf</code> + <code>CUDA_CHECK</code> 调试 100 行 kernel 够用。但当你 forward 跑了 30 个 kernel 然后某处输出 NaN，靠 printf 没用——必须上专业工具。</p>
+
+    <h3>2.7.1 compute-sanitizer：CUDA 版 valgrind</h3>
+
+    <p><code>compute-sanitizer</code>（前身 <code>cuda-memcheck</code>）是定位 kernel 内 bug 的<strong>唯一可靠工具</strong>。四种工作模式：</p>
+
+<pre><code class="language-bash"># 1) memcheck — 越界、未初始化、非法指针
+compute-sanitizer --tool memcheck ./my_app
+
+# 2) racecheck — shared memory 数据竞争（漏 __syncthreads）
+compute-sanitizer --tool racecheck ./my_app
+
+# 3) initcheck — 用了未初始化的 device 内存
+compute-sanitizer --tool initcheck ./my_app
+
+# 4) synccheck — block 内 sync 不一致（部分 thread early-exit）
+compute-sanitizer --tool synccheck ./my_app</code></pre>
+
+    <p>典型输出：</p>
+<pre><code>========= Invalid __global__ write of size 4 bytes
+=========     at 0x70 in matmul_kernel(float*, float*, float*, int, int, int)
+=========     by thread (5,3,0) in block (1,0,0)
+=========     Address 0x7f8e... is out of bounds
+=========     Saved host backtrace up to driver entry point at error</code></pre>
+
+    <p>编译时加 <code>-lineinfo</code>（不是 <code>-g</code>，会关优化）才能看到行号：</p>
+
+<pre><code class="language-bash">nvcc -O2 -lineinfo -arch=sm_80 mykernel.cu -o app
+compute-sanitizer ./app</code></pre>
+
+    <p><strong>典型经验</strong>：发布前对每个 kernel 都跑一次 memcheck + racecheck，能抓出 80% 的隐藏 bug。CI 流水线里也会跑（虽然慢 10-100×）。</p>
+
+    <h3>2.7.2 cuda-gdb：源码级断点调试</h3>
+
+    <p>支持 kernel 内打断点、单步、看变量。前提：编译用 <code>-g -G</code>（device 调试符号），<strong>会关闭所有优化，性能掉 10×+</strong>，仅用于调试。</p>
+
+<pre><code class="language-bash">nvcc -g -G -arch=sm_80 mykernel.cu -o app_dbg
+cuda-gdb ./app_dbg
+
+(cuda-gdb) break mykernel.cu:42      # device 代码也能打断点
+(cuda-gdb) run
+(cuda-gdb) cuda thread (5,3,0) block (1,0,0)    # 切到特定 thread
+(cuda-gdb) print x
+(cuda-gdb) info cuda warps</code></pre>
+
+    <p>VSCode + Nsight VSCode 插件能让你在 IDE 里点断点（非常推荐）。</p>
+
+    <h3>2.7.3 常见数值 bug 诊断流程</h3>
+
+    <p><strong>症状：输出 NaN / Inf</strong>，定位顺序：</p>
+    <ol>
+      <li>在每个 kernel 后插临时 <code>check_nan</code>，二分定位是哪个 kernel 先产生 NaN</li>
+      <li>看可疑 kernel 的输入：是输入就 NaN 了还是 kernel 算坏的？</li>
+      <li>kernel 算坏的话：检查除零（softmax 没减 max？rsqrt(0)？），log(负数)，exp(过大)</li>
+    </ol>
+
+<pre><code class="language-cpp">// 临时 NaN 探测 kernel — 加在 forward 各点对照
+__global__ void nan_probe(const float* x, int n, int* found, const char* name) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n &amp;&amp; (isnan(x[i]) || isinf(x[i])))
+        atomicExch(found, 1);
+}
+
+// host: 跑完每个算子调一次
+int h_found = 0, *d_found;
+cudaMalloc(&amp;d_found, 4);
+cudaMemset(d_found, 0, 4);
+nan_probe&lt;&lt;&lt;...&gt;&gt;&gt;(out, n, d_found, "after_layernorm");
+cudaMemcpy(&amp;h_found, d_found, 4, cudaMemcpyDeviceToHost);
+if (h_found) fprintf(stderr, "NaN/Inf at after_layernorm!\n");</code></pre>
+
+    <h3>2.7.4 版本陷阱与诊断脚本</h3>
+
+    <p>客户报"程序在新环境跑不起来"，9 成是版本不匹配。诊断脚本：</p>
+
+<pre><code class="language-bash">#!/usr/bin/env bash
+# diag.sh — 在客户环境跑一次, 把输出粘给我
+echo "=== 内核驱动 ==="
+nvidia-smi --query-gpu=driver_version,cuda_version --format=csv,noheader
+
+echo "=== CUDA Toolkit ==="
+nvcc --version 2&gt;/dev/null || echo "nvcc 不在 PATH"
+ls -la /usr/local/cuda 2&gt;/dev/null
+
+echo "=== Python 侧 ==="
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" 2&gt;/dev/null
+python -c "import torch; print('available:', torch.cuda.is_available(), 'count:', torch.cuda.device_count())"
+
+echo "=== libcudart ==="
+ldconfig -p | grep libcudart
+
+echo "=== 容器 ==="
+[[ -f /.dockerenv ]] &amp;&amp; echo "in docker" || echo "host"</code></pre>
+
+    <h3>2.7.5 生产 kernel 的 "不要" 清单</h3>
+    <ul>
+      <li><strong>不要</strong>在生产 kernel 留 <code>printf</code>——device-side printf 有固定大小缓冲（默认 1 MB），高吞吐场景会丢日志，且严重拖慢吞吐</li>
+      <li><strong>不要</strong>用 <code>assert</code>——device assert 失败直接 abort 整个 context，整张 GPU 都得重置</li>
+      <li><strong>不要</strong>在 hot path 里 <code>cudaDeviceSynchronize()</code>——它会让所有 stream 都阻塞，破坏 overlap</li>
+      <li><strong>不要</strong>裸用 <code>cudaMalloc</code> 在 hot path——每次 malloc 几百微秒。用 memory pool 或预分配</li>
+      <li><strong>不要</strong>在 kernel 里 <code>new</code> / <code>malloc</code>（device-side heap，极慢且容量小）</li>
+    </ul>
+
+    <h2 id="frontier">2.8 研究前沿（2025-2026）：GPU kernel 开发的语言之战</h2>
+
+    <p>"写 CUDA C++" 在 2026 已经不是唯一选择。下面是几个真正在生产中崛起的替代方案，每个都让你<strong>用更少的代码达到接近 CUDA 的性能</strong>。</p>
+
+    <h3>2.8.1 Triton 3.0+（OpenAI，事实标准的"Python CUDA"）</h3>
+
+    <p>Triton 用 Python-like 语法描述 tile-level 计算，编译器自动处理 block / warp / lane 分配。<strong>FlashAttention 早期版本、vLLM、SGLang 的大部分 kernel</strong> 都用 Triton 写。</p>
+
+<pre><code class="language-python">import triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid    = tl.program_id(axis=0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask    = offsets &lt; n
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x + y, mask=mask)
+
+# Python 侧:
+add_kernel[(triton.cdiv(n, 1024),)](x, y, out, n, BLOCK=1024)</code></pre>
+
+    <p>2025-2026 关键更新：</p>
+    <ul>
+      <li><strong>Triton 3.0+</strong> 加 Hopper TMA / wgmma 完整支持</li>
+      <li><strong>Triton-Blackwell</strong> 支持 fp4 + TMEM</li>
+      <li><strong>Triton-CPU</strong> 让同一 kernel 跑 GPU 和 CPU</li>
+      <li><strong>TritonBench</strong> (Meta) — 100+ 个工业 kernel benchmark</li>
+    </ul>
+
+    <h3>2.8.2 ThunderKittens（Stanford, 2024-2025）— 100 行写 attention</h3>
+
+    <p>ThunderKittens (TK) 是 Stanford Hazy Research 团队推出的 C++ 嵌入式 DSL，专为<strong>极简 Tensor Core 编程</strong>设计。一个完整的 FlashAttention v2 不到 100 行：</p>
+
+<pre><code class="language-cpp">// ThunderKittens 风格 (简化伪代码)
+using namespace kittens;
+__global__ void attn_kernel(...) {
+    auto Q_tile = make_tile&lt;rt_fl, 16, 64&gt;();   // tile abstraction
+    auto K_tile = make_tile&lt;rt_fl, 64, 16&gt;();
+    auto V_tile = make_tile&lt;rt_fl, 16, 64&gt;();
+
+    load(Q_tile, Q_global);                      // 自动 cp.async + TMA
+    for (int kt = 0; kt &lt; n_kv_tiles; ++kt) {
+        load(K_tile, K_global + kt);
+        load(V_tile, V_global + kt);
+        auto S = mm&lt;trans_b&gt;(Q_tile, K_tile);     // 自动 wgmma
+        softmax_inplace(S);
+        accumulate(O_tile, mm(S, V_tile));
+    }
+    store(O_global, O_tile);
+}</code></pre>
+
+    <p>性能逼近手写 CUTLASS（90%+ peak）。<strong>是 2025 后教研用的事实标准</strong>。FA v3 重写、各种新 attention 变体都用 TK 原型化。</p>
+
+    <h3>2.8.3 CUTLASS 3.x + CuTe DSL（NVIDIA 官方）</h3>
+
+    <p>CUTLASS 3.5+ 全面用 CuTe（Layout-of-Tensor）DSL 重写。CuTe 把"tile / warp / instruction"统一成 layout 代数，能在编译期推导出所有索引和访问模式：</p>
+
+<pre><code class="language-cpp">// CuTe 风格 (Python 绑定也快出了, 2025)
+using namespace cute;
+auto thr_layout = make_layout(make_shape(_8{}, _32{}));   // 8x32 thread layout
+auto data_layout = make_layout(make_shape(_128{}, _64{}),
+                                make_stride(_64{}, _1{}));
+auto tensor = make_tensor(ptr, data_layout);
+auto thr_tile = local_partition(tensor, thr_layout, tid);
+// 编译期就知道每 thread 拿哪些元素, 自动 swizzle / vectorize</code></pre>
+
+    <p>学习曲线陡，但<strong>是 NVIDIA 长期主推方向</strong>。Blackwell 上的 TMEM GEMM 必须用 CuTe / CUTLASS 写。</p>
+
+    <h3>2.8.4 Mojo / MAX（Modular，2024-2026）</h3>
+
+    <p>Mojo 是 Python 超集 + 系统级性能，由 Chris Lattner（LLVM 创始人）团队设计。声称"Python 语法 × C++ 性能"，2025 年开始有 CUDA backend，能编译到 PTX。</p>
+
+    <p>定位介于 Triton 和 CUDA 之间，吸引<strong>不想学 C++ 但需要超过 Python 性能</strong>的研究者。生产部署目前还少，2026 年值得关注。</p>
+
+    <h3>2.8.5 各方案对比</h3>
+
+    <table>
+      <tr><th>方案</th><th>语言</th><th>性能（vs CUDA）</th><th>学习曲线</th><th>2026 用户</th></tr>
+      <tr><td>CUDA C++</td><td>C++</td><td>100% (基线)</td><td>陡</td><td>NVIDIA, 老牌 kernel 团队</td></tr>
+      <tr><td>Triton</td><td>Python</td><td>80-95%</td><td>平缓</td><td>vLLM, SGLang, 研究界</td></tr>
+      <tr><td>ThunderKittens</td><td>C++ 模板</td><td>90-95%</td><td>中等</td><td>Stanford, 学术</td></tr>
+      <tr><td>CUTLASS / CuTe</td><td>C++ 模板</td><td>95-100%</td><td>非常陡</td><td>NVIDIA 官方, FlashAttention</td></tr>
+      <tr><td>Mojo</td><td>Python+</td><td>~80%（仍发展）</td><td>平缓</td><td>少数早期采用者</td></tr>
+      <tr><td>JAX / Pallas</td><td>Python</td><td>70-90%</td><td>中等</td><td>Google 内部 + TPU</td></tr>
+      <tr><td>MLIR / IREE</td><td>编译器</td><td>—</td><td>非常陡</td><td>编译器研究</td></tr>
+    </table>
+
+    <p><strong>2026 务实选择建议</strong>：</p>
+    <ul>
+      <li><strong>学习 / 研究</strong>：先 CUDA C++ 打基础（本教程），然后转 Triton + ThunderKittens 提效率</li>
+      <li><strong>新 kernel 原型</strong>：直接 Triton</li>
+      <li><strong>极致性能</strong>：CUTLASS / CuTe（Blackwell 上几乎是必选）</li>
+      <li><strong>跨平台</strong>：JAX/Pallas (TPU + GPU) 或者等 Mojo 成熟</li>
+    </ul>
+
+    <h3>2.8.6 AI 辅助 kernel 开发（2025 后兴起）</h3>
+
+    <p>大模型开始能写出可用的 CUDA kernel：</p>
+    <ul>
+      <li><strong>Sakana AI</strong>（2024 末）："AI CUDA Engineer" — LLM 自动生成 + benchmark CUDA kernel</li>
+      <li><strong>KernelBench</strong>（Stanford, 2025）— LLM 写 kernel 的标准评测</li>
+      <li><strong>Claude 3.5+/GPT-5 写 Triton</strong> 已经接近资深工程师水平（简单 kernel）</li>
+    </ul>
+
+    <p>意味着<strong>2026 工程师的角色更偏 "kernel 设计 + 验证"</strong>，不再是"逐行写"。但<strong>读懂 CUDA、debug CUDA</strong>依然是不可替代的核心技能——这正是本教程的目标。</p>
+
+    <h2>2.9 常见坑</h2>
+    <ul>
+      <li>kernel 修改了数据但 host 读到旧值 → 忘记 <code>cudaDeviceSynchronize</code>（或 KERNEL_CHECK）。</li>
+      <li><code>cudaErrorInvalidConfiguration</code> → block 维度超 1024 或 shared mem 超限。</li>
+      <li><code>cudaErrorIllegalAddress</code> → kernel 内越界访问、空指针、misaligned 加载。用 <code>cuda-memcheck</code> 或 <code>compute-sanitizer</code> 定位行号。</li>
+      <li>整个程序"成功"但结果全 0 → 多半 kernel 没启动（参数错被无视）。永远加 <code>KERNEL_CHECK</code>。</li>
+    </ul>
+
+    <h2>下一步</h2>
+    <p>第 3 章我们把"启动 N 个线程并行处理 N 个元素"系统化：<strong>线程模型与索引</strong>。重点是 1D/2D 索引计算，以及处理"N 不是 block size 整数倍"的边界条件。</p>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch01-intro/index.html"><span class="label">上一章</span>← 01 · 导论与环境</a>
+      <a class="next" href="../ch03-threads/index.html"><span class="label">下一章</span>03 · 线程模型与索引 →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body>
+</html>

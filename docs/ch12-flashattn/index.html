@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 12 章 · FlashAttention</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head><body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol><li><a href="../ch01-intro/index.html">导论与环境</a></li><li><a href="../ch02-hello/index.html">Hello CUDA</a></li><li><a href="../ch03-threads/index.html">线程模型与索引</a></li><li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li></ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5"><li><a href="../ch05-memory/index.html">内存层级</a></li><li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li><li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li><li><a href="../ch08-async/index.html">性能分析与异步</a></li></ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9"><li><a href="../ch09-gemm/index.html">GEMM 深入</a></li><li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li><li><a href="../ch11-attention/index.html">Attention 入门</a></li><li><a href="../ch12-flashattn/index.html" class="current">FlashAttention</a></li><li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li><li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li></ol>
+      <div class="stage">附录</div><ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 12 章 · FlashAttention</h1>
+    <div class="chapter-meta"><span>⏱️ 90 分钟</span><span>🎯 写出 Fused Attention Kernel</span><span>📂 code/ch12_flashattn/</span><span>🔥 关键瓶颈章</span></div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 FlashAttention 为什么"既快又省显存"</li>
+      <li>把第 10 章的 online softmax 推广到 tile-wise（block 内分块）</li>
+      <li>看懂 v1 → v2 的差异（循环顺序换、warp 切分更友好）</li>
+    </ul>
+
+    <h2>12.1 朴素 Attention 的根本问题</h2>
+    <p>第 11 章看到：S, P 都是 T×T 张量，必须写回 HBM 才能下一步用。HBM 读写带宽是 attention 瓶颈，FLOPs 反而不是问题。</p>
+
+    <p>FlashAttention 的核心洞察：</p>
+    <div class="callout">
+      <strong>把整个 attention（QKᵀ + softmax + ·V）融合成一个 kernel，中间结果只在 shared memory / 寄存器里流动，不回 HBM。</strong><br>
+      但 softmax 需要全行的 max 和 sum 才能算——这个"全行依赖"用 <em>online softmax</em> 化解：分块时维护 running (m, l) 即可。
+    </div>
+
+    <h2>12.2 算法推导</h2>
+    <p>把 Q 沿行切成 Br × D 的块，K/V 沿行切成 Bc × D 的块。
+       对每个 Q 块，扫一遍所有 K/V 块，维护 running output O_i 和 (m_i, l_i)：</p>
+
+<pre class="mermaid">
+graph TD
+    Init["初始化:<br/>O_i = 0,  l_i = 0,  m_i = -∞"]
+    Init --> Loop["for j in K/V tiles:"]
+    Loop --> S["S_ij = Q_i @ K_j^T * scale"]
+    S --> Mnew["m_new = max(m_i, rowmax(S_ij))"]
+    Mnew --> Pij["P_ij = exp(S_ij - m_new)"]
+    Pij --> Lnew["l_new = exp(m_i - m_new) * l_i + rowsum(P_ij)"]
+    Lnew --> Onew["O_i = exp(m_i - m_new) * O_i + P_ij @ V_j<br/>(暂不除 l_new)"]
+    Onew --> Update["m_i = m_new,  l_i = l_new"]
+    Update --> Loop
+    Loop --> Out["最终: O_i /= l_i,  写回 HBM"]
+    style S fill:#f6f8fa,stroke:#0969da
+    style Onew fill:#f6f8fa,stroke:#1a7f37
+</pre>
+
+    <h3>关键公式：online rescale</h3>
+    <p>每次新 K/V 块来了，行最大值 <code>m</code> 可能变大。已经累积的 <code>l_old</code> 与 <code>O_old</code> 都是相对旧 <code>m_old</code> 算的，必须乘 <code>exp(m_old - m_new)</code> 修正：</p>
+<pre><code>l_new = exp(m_old - m_new) * l_old + rowsum(exp(S_ij - m_new))
+O_new = exp(m_old - m_new) * O_old + exp(S_ij - m_new) @ V_j</code></pre>
+
+    <p>最后才一次除 <code>l</code> 得真正的归一化输出。这就是<strong>不需要看到完整行就能算 softmax</strong>的秘密。</p>
+
+    <h2>12.3 实现要点</h2>
+    <p>源码：<a href="../../code/ch12_flashattn/flash_attn_v1.cu">flash_attn_v1.cu</a>（教学简化版）。
+       为方便读 D=64 固定、Br=Bc=64、单 head、fp32、无 Tensor Core。</p>
+
+<pre><code class="language-cpp">// 简化: blockDim.x = Br = 64, 每 thread 处理 Q 的 1 行
+// 每 thread 在 shared mem 上维护 O_s[Br][Dm], m_s[Br], l_s[Br]
+__shared__ float Qs[Br][Dm], Ks[Bc][Dm], Vs[Bc][Dm], Ss[Br][Bc];
+
+for (int kt = 0; kt &lt; n_kv_tiles; ++kt) {
+    /* 1) load K_j, V_j to shared (256 thread 协作) */
+    __syncthreads();
+
+    if (tid &lt; Br) {
+        /* 2) S_ij = Q_i @ K_j^T * scale */
+        for (int j = 0; j &lt; Bc; ++j) {
+            float s = 0;
+            for (int d = 0; d &lt; Dm; ++d) s += Qs[tid][d] * Ks[j][d];
+            Ss[tid][j] = s * scale + causal_mask(tid, j);
+        }
+        /* 3) online softmax merge */
+        float m_old = m_s[tid], l_old = l_s[tid];
+        float m_new = fmaxf(m_old, rowmax(Ss[tid]));
+        float l_new = exp(m_old - m_new) * l_old + rowsum(exp(Ss[tid] - m_new));
+        float rescale = exp(m_old - m_new);
+        /* 4) O update */
+        for (int d = 0; d &lt; Dm; ++d) {
+            float acc = O_s[tid][d] * rescale;
+            for (int j = 0; j &lt; Bc; ++j) acc += exp(Ss[tid][j] - m_new) * Vs[j][d];
+            O_s[tid][d] = acc;
+        }
+        m_s[tid] = m_new; l_s[tid] = l_new;
+    }
+    __syncthreads();
+}
+/* 5) O /= l, 写回 */</code></pre>
+
+    <h2>12.4 v1 → v2 的进化</h2>
+    <table>
+      <tr><th></th><th>v1</th><th>v2</th></tr>
+      <tr><td>外层循环</td><td>per-Q tile</td><td>per-Q tile (相同)</td></tr>
+      <tr><td>warp 切分</td><td>每 warp 算 S 的一行</td><td>每 warp 算 S 的一<strong>列</strong>，更并行</td></tr>
+      <tr><td>非矩阵 FLOPs</td><td>每次 rescale 都做</td><td>合并到一次最终 rescale，更省 FLOP</td></tr>
+      <tr><td>backward</td><td>实现复杂</td><td>更友好，公开 backward 套路</td></tr>
+      <tr><td>典型加速</td><td>baseline</td><td>2-3×</td></tr>
+    </table>
+
+    <p>本章教学版接近 v1。生产实现（FA v2/v3、xformers、CUTLASS-FA）都用：</p>
+    <ul>
+      <li><strong>Tensor Core</strong> (mma.sync) 跑 S 和 PV 的两个 GEMM</li>
+      <li><strong><code>cp.async</code></strong> 重叠 K/V 加载和计算</li>
+      <li><strong>warp specialization</strong>（FA v3, Hopper）让一组 warp 做 load 另一组做 compute</li>
+      <li><strong>swizzled shared layout</strong> 消除 bank conflict</li>
+    </ul>
+
+    <h2>12.5 性能对比（T4 / A100 估计）</h2>
+    <table>
+      <tr><th>T</th><th>D</th><th>朴素 (Ch11) ms</th><th>本章 FA v1 ms</th><th>FA v2 (官方) ms</th></tr>
+      <tr><td>1024</td><td>64</td><td>~5</td><td>~1.2</td><td>~0.4</td></tr>
+      <tr><td>4096</td><td>64</td><td>~85</td><td>~12</td><td>~3</td></tr>
+      <tr><td>8192</td><td>128</td><td>OOM</td><td>~80</td><td>~25</td></tr>
+    </table>
+
+    <p>本章教学版只追上"FlashAttention 的思想"，没追上"FlashAttention 的工程"。真要做工业用版，去看 <a href="https://github.com/Dao-AILab/flash-attention">官方仓库</a>。</p>
+
+    <h2>12.6 与 vLLM PagedAttention 的关系</h2>
+    <p>FlashAttention 优化的是<strong>单个序列的 attention 计算</strong>。
+       vLLM 的 PagedAttention 优化的是<strong>多请求并发时 KV cache 的显存管理</strong>——它把 KV cache 按"页"管理，避免显存碎片化。
+       两者正交，可叠加：vLLM 的 attention kernel 实际是 PagedAttention 调用 FlashAttention 风格 fused kernel。</p>
+
+    <h2>12.7 自检</h2>
+    <details><summary>Q1: 为什么 FlashAttention 不"算得快"，HBM 流量却低？</summary><p>它做的总 FLOPs 没变（甚至略多，因为多了 rescale）。省的是<strong>访存</strong>。LLM 推理 attention 是 memory-bound，所以省访存 = 加速。</p></details>
+    <details><summary>Q2: 我能在 v1 里改顺序：先对 K/V 外循环、Q 内循环吗？</summary><p>能，那就是 FA v2 的写法。好处：不同 Q tile 的输出独立，可以并行；缺点：每个 K/V 加载到 shared 后被用更多次，对带宽更友好。</p></details>
+    <details><summary>Q3: tile 大小 (Br, Bc) 怎么选？</summary><p>受 shared mem 容量约束：Qs + Ks + Vs + Ss = (Br + 2Bc) * D + Br*Bc。A100 上 D=64, Br=Bc=64 → ~33 KB, 放得下。要把 Bc 开到 128 需 fp16 或者更大 shared。</p></details>
+    <details><summary>Q4: 我看到 FA 用了 LSE (logsumexp) 输出，干嘛用？</summary><p>用于 backward 重新计算 P。training 时不存 P 只存 LSE，重新算 P_ij = exp(S_ij - LSE_i)，省显存。</p></details>
+    <details><summary>Q5: 教学版精度够吗？</summary><p>fp32 输入累加，理论上和 cpu_ref 接近（max_abs &lt; 1e-3）。生产 fp16 版本要更小心：accumulator 必须 fp32 否则 long sequence 累加错误。</p></details>
+
+    <h2>12.8 练习</h2>
+    <ol>
+      <li>把本章 kernel 改成支持<strong>非整数倍 T</strong>（最后一个 Q tile 不满）。</li>
+      <li>实现 v2 风格的"外循环改 Q tile, 内循环 K/V"，并对比 GFLOPS。</li>
+      <li>fp16 输入 fp32 累加版本（提示：把 Q/K/V 改 __half，shared 也改 __half，acc 仍 float）。</li>
+      <li>用 Triton 实现同一个 kernel（参考 <a href="https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html">Triton 官方 tutorial 06</a>），对比代码量。</li>
+    </ol>
+
+    <h2 id="industry">12.9 工业实战：FA v2/v3、KV cache、PagedAttention、长上下文</h2>
+
+    <h3>12.9.1 FA v1 → v2 的三个核心改动</h3>
+    <ol>
+      <li><strong>外循环换成 Q tile</strong>：v1 外循环 K/V → 每个 Q tile 反复加载；v2 外循环 Q → Q tile 加载一次保留在寄存器，K/V tile 流过。每个 Q tile 独立 → block 间并行更高。</li>
+      <li><strong>减少 rescale 次数</strong>：v1 每个 K/V tile 都把已累加的 O 乘 <code>exp(m_old - m_new)</code>；v2 把这步推迟到 K/V 循环结束统一做一次。</li>
+      <li><strong>warp 切分更细</strong>：v1 每 warp 算 S 的一行 → warp 间需要 row-reduce；v2 每 warp 算 S 的<strong>一列</strong> → warp 间几乎独立。</li>
+    </ol>
+    <p>实测 v2 在 A100 上 fp16 attention 跑到 220+ TFLOPS（占 312 TF peak 的 70%）。</p>
+
+    <h3>12.9.2 FA v3 (Hopper)：TMA + warp specialization + fp8</h3>
+    <ul>
+      <li><strong>TMA</strong> 一条指令加载 64×64 tile，硬件自动 swizzle</li>
+      <li><strong>warpgroup mma (wgmma)</strong>：4 个 warp 协作算一个大 mma</li>
+      <li><strong>warp specialization</strong>：4 warp 分两组——一组 producer（只 load），一组 consumer（只算），mbarrier 同步。软件版乱序</li>
+      <li><strong>fp8</strong>：H100 上 fp8 attention 比 fp16 再快 2× (240 → 480 TFLOPS)</li>
+    </ul>
+
+    <h3>12.9.3 与 KV cache 集成（decode 路径）</h3>
+
+    <p>推理 decode 时 attention 输入：</p>
+<pre><code>Q_new     : (1, D)             新一步 query
+K_cache   : (T_so_far, D)      历史 K
+V_cache   : (T_so_far, D)      历史 V</code></pre>
+
+<pre><code class="language-cpp">// FA decode kernel 骨架: Q 只有 1 行, K/V tile 流过
+__global__ void flash_attn_decode(
+    const __half* Q,                // (1, n_head, D_head)
+    const __half* K_cache,          // (T_max, n_head_kv, D_head)
+    const __half* V_cache, __half* O,
+    int T_so_far, int n_head, int n_head_kv, int D_head)
+{
+    int h    = blockIdx.x;
+    int h_kv = h / (n_head / n_head_kv);   // GQA mapping
+
+    __shared__ __half Qs[D_head];           // Q 整行直接进 shared
+    if (threadIdx.x &lt; D_head) Qs[threadIdx.x] = Q[h * D_head + threadIdx.x];
+    __syncthreads();
+
+    float m = -INFINITY, l = 0;
+    float O_acc[D_head] = {0};
+    for (int t0 = 0; t0 &lt; T_so_far; t0 += BLOCK_T) {
+        // load K/V tile of BLOCK_T tokens, compute QK, online softmax, update O
+    }
+    // 写回
+}</code></pre>
+
+    <h3>12.9.4 PagedAttention — vLLM 显存利用率从 40% → 90%+</h3>
+
+    <p>批量推理 N 个请求长度各异，contiguous 分配 max_seq_len 浪费 90% 显存。PagedAttention 借鉴 OS 分页：</p>
+    <ul>
+      <li>KV cache 切成固定大小 block（典型 16 token / block）</li>
+      <li>每请求维护 block_table（逻辑 → 物理 block 映射）</li>
+      <li>新 token 来了 alloc 一个 block</li>
+      <li>attention kernel 通过 block table indirection 读 K/V</li>
+    </ul>
+
+<pre><code class="language-cpp">// 朴素:
+const __half* k = K_cache + t * stride;
+
+// Paged:
+int block_id    = block_table[req_id * max_blocks + t / BLOCK_SIZE];
+int offset_in_b = t % BLOCK_SIZE;
+const __half* k = K_blocks + block_id * (BLOCK_SIZE * D_head) + offset_in_b * D_head;</code></pre>
+
+    <p>kernel overhead &lt; 5%，但<strong>batch size 翻 2-3 倍 → 吞吐 2-4×</strong>（vLLM 论文）。</p>
+
+    <h3>12.9.5 Sliding Window Attention (Mistral)</h3>
+
+    <p>每个 Q 只 attend 最近 W=4096 个 K/V。FA kernel 在外循环跳过 out-of-window tile：</p>
+<pre><code class="language-cpp">if (kt_end &lt;= max(0, qi - W)) continue;   // tile 完全在 window 外
+if (kt_start &gt; qi)             continue;   // causal 跳过</code></pre>
+    <p>T=32K 时复杂度从 O(T²) 降到 O(T·W)。Mistral 7B 用 8K window 实现 32K 上下文。</p>
+
+    <h3>12.9.6 100K+ 长上下文的额外手段</h3>
+    <ul>
+      <li><strong>Ring Attention</strong>：多卡分担 K/V，环形传递，1M context 可行</li>
+      <li><strong>YaRN / NTK-aware RoPE</strong>：把 4K 训练模型外推到 100K（不重训）</li>
+      <li><strong>State-space (Mamba)</strong>：放弃 attention，O(T) 复杂度</li>
+      <li><strong>KV cache 量化</strong>：fp16 → int8 / int4，显存减半到 1/4</li>
+      <li><strong>Cache 卸载</strong>：冷 KV 放 CPU memory，需要时拉回</li>
+    </ul>
+
+    <h3>12.9.7 用现成库 vs 自己写</h3>
+    <table>
+      <tr><th>场景</th><th>建议</th></tr>
+      <tr><td>标准 MHA/GQA + prefill</td><td><code>flash-attn</code> Python 库 (Tri Dao)</td></tr>
+      <tr><td>decode + KV cache + GQA</td><td>vLLM 的 <code>flash_attn_with_kvcache</code></td></tr>
+      <tr><td>PagedAttention</td><td>vLLM 内置 kernel</td></tr>
+      <tr><td>自定义 mask / 稀疏 pattern</td><td>xFormers 或 Triton 自己写</td></tr>
+      <tr><td>fp8 / Hopper</td><td>FlashAttention v3</td></tr>
+      <tr><td>研究新算法</td><td>Triton 写，性能接近 CUDA 但 Python 调试方便</td></tr>
+    </table>
+
+    <h2 id="frontier">12.10 研究前沿（2025-2026）：FA v3/v4、FlashMLA、FlashInfer、FlexAttention</h2>
+
+    <h3>12.10.1 FlashAttention v3（2024.07）— Hopper 完整解法</h3>
+
+    <p>论文标题就是"Fast and Accurate Attention with Asynchrony and Low-precision"。三大武器：</p>
+
+    <ol>
+      <li><strong>TMA bulk async load</strong>：替代手写 cp.async 循环。一条 PTX 指令拷 64×64 tile</li>
+      <li><strong>warp specialization</strong>：producer warp 跑 TMA，consumer warps 跑 wgmma（见 Ch6.10.1）</li>
+      <li><strong>FP8 + 块量化</strong>：Q、K、V、S 全 fp8，accumulator fp32</li>
+    </ol>
+
+    <table>
+      <tr><th>版本</th><th>H100 性能 (fp16)</th><th>占 peak</th><th>fp8 性能</th></tr>
+      <tr><td>FA v2</td><td>335 TF</td><td>34%</td><td>—</td></tr>
+      <tr><td>FA v3 fp16</td><td>740 TF</td><td>75%</td><td>—</td></tr>
+      <tr><td>FA v3 fp8</td><td>—</td><td>—</td><td>1.2 PF (75% of 1.6 PF)</td></tr>
+    </table>
+
+    <h3>12.10.2 FlashMLA（DeepSeek 2025）— MLA 专用</h3>
+
+    <p>MLA（见 11.9.1）的 attention 不一样：cache 的是低维 c_kv（d_c=512），attention 内部要做 c_kv 的 up-projection。<strong>FlashMLA</strong> 是为 MLA 设计的 FA 变种：</p>
+
+    <ul>
+      <li>主 loop 直接读 c_kv 而非完整 K/V</li>
+      <li>Q 端预先吸收 W_UK，attention 内不再 up-project K</li>
+      <li>V 的 up-project 留到 PV 阶段，融合进 mma 链</li>
+      <li>tile shape 针对 d_c=512 优化（比标准 d_head=128 高 4×）</li>
+    </ul>
+
+    <p>开源仓库：<code>github.com/deepseek-ai/FlashMLA</code>（2025.02）。<strong>H800 上 MLA decode 跑到 580 TF + 3000 GB/s 带宽利用</strong>。</p>
+
+    <h3>12.10.3 FlashInfer — attention kernel dispatch 层</h3>
+
+    <p>vLLM、SGLang、Llama-stack 越来越倾向不自己写 attention，统一通过 <strong>FlashInfer</strong> 调用。它的设计：</p>
+
+<pre><code class="language-python">import flashinfer
+# 用户传 KV layout + 模型配置, FlashInfer 选最优 kernel
+o = flashinfer.batch_decode_with_paged_kv_cache(
+    q, paged_k_cache, paged_v_cache, block_tables, kv_lens,
+    pos_encoding_mode="ROPE_LLAMA",
+    kv_layout="NHD",       # paged 布局风格
+    use_tensor_cores=True,
+    sm_scale=None,
+)</code></pre>
+
+    <p>支持矩阵：</p>
+    <ul>
+      <li>MHA / MQA / GQA / MLA</li>
+      <li>Causal / sliding window / sparse mask</li>
+      <li>RoPE / ALiBi / 无 PE</li>
+      <li>fp16 / bf16 / fp8 / fp4</li>
+      <li>Paged KV / contiguous KV / radix-cached</li>
+    </ul>
+
+    <p>2025-2026 工业事实：自己手写 attention 的越来越少，<strong>除非有特别的研究 motivation</strong>。生产团队都接入 FlashInfer 或类似 dispatch 层。</p>
+
+    <h3>12.10.4 PyTorch FlexAttention（2024.10）</h3>
+
+    <p>Meta 发布的 PyTorch 2.5+ 新 API，把"自定义 attention mask + score_mod"编译成高效 FA-style kernel：</p>
+
+<pre><code class="language-python">from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+def causal_mask(b, h, q_idx, kv_idx):
+    return q_idx &gt;= kv_idx
+
+def alibi_score(score, b, h, q_idx, kv_idx):
+    bias = (q_idx - kv_idx) * alibi_slope[h]
+    return score + bias
+
+mask = create_block_mask(causal_mask, B, H, M, N)
+out = flex_attention(q, k, v, score_mod=alibi_score, block_mask=mask)
+# 编译器自动产出 FA 风格 fused kernel</code></pre>
+
+    <p>对研究者最大价值：<strong>试一个新 mask / 新 score 变体不用写 CUDA</strong>。性能跟手写 FA 差距 &lt; 15%。学术界 2025 后做 attention 变体研究几乎全用 FlexAttention 原型。</p>
+
+    <h3>12.10.5 Ring Attention & Stripe Attention — 跨 GPU 长 context</h3>
+
+    <p>单 GPU 装不下 1M token 的 K/V。<strong>Ring Attention</strong>（Liu et al., 2023, 2024 工业化）：</p>
+
+<pre><code>1. 把 K, V 沿 T 维切到 N 张 GPU, 每张持一段
+2. Q 也切到 N 张
+3. K/V 在环上传递: GPU_i 收完 GPU_(i-1) 的 K/V → 算一部分 attention → 传给 GPU_(i+1)
+4. 一圈后所有 GPU 都看到全部 K/V, 但峰值显存只是 1/N
+
+延迟: 跟通信 overlap, 实测打满 NVLink 时性能损失 &lt; 20%</code></pre>
+
+    <p><strong>Stripe Attention</strong>（Brandon et al., 2023）：跟 Ring 同思路但 chunk 设计对 causal mask 更友好，长 context 训练用得多。</p>
+
+    <p>实战：Llama 4 / Gemini 1.5 系列长 context（1-10M token）用的就是这类技术。<strong>NVSHMEM</strong>（见 8.9.5）替代 NCCL 让通信粒度更细。</p>
+
+    <h3>12.10.6 Striped + Chunked + Prefill 混合调度</h3>
+
+    <p>真实 LLM 服务的最终形态（vLLM 0.6+、SGLang、TRT-LLM 都在朝这个方向）：</p>
+
+<pre class="mermaid">
+graph TB
+    A["用户请求队列"] --> B["调度器"]
+    B --> C["chunked prefill<br/>(64-512 token 一片)"]
+    B --> D["decode batch<br/>(已 prefill 的请求)"]
+    C --> E["在 prefill chunk 末用 online softmax<br/>merge 之前 prefix"]
+    D --> F["FlashInfer paged decode"]
+    E --> G["统一 attention kernel"]
+    F --> G
+    G --> H["输出 token"]
+    style C fill:#f6f8fa,stroke:#bf8700
+    style D fill:#f6f8fa,stroke:#1a7f37
+</pre>
+
+    <p>核心组件：</p>
+    <ul>
+      <li><strong>Chunked Prefill</strong>：长 prompt 分多 chunk，每 chunk 跟 decode 同 step 跑，<strong>消除 prefill 阻塞 decode</strong></li>
+      <li><strong>Prefix Caching</strong>：相同 system prompt 命中 KV cache, 跳过 prefill</li>
+      <li><strong>Disaggregated Serving</strong>：prefill 节点 + decode 节点分离, 各自优化（见 Ch14.6）</li>
+    </ul>
+
+    <h3>12.10.7 2026 attention kernel 推荐栈</h3>
+
+    <table>
+      <tr><th>需求</th><th>推荐</th></tr>
+      <tr><td>标准 attention（MHA/GQA）</td><td>FlashInfer 或 vLLM 内置</td></tr>
+      <tr><td>MLA（DeepSeek 系）</td><td>FlashMLA</td></tr>
+      <tr><td>自定义 mask / score</td><td>PyTorch FlexAttention 或 Triton</td></tr>
+      <tr><td>fp8 attention</td><td>FA v3 fp8 / FlashInfer fp8</td></tr>
+      <tr><td>fp4 attention（Blackwell）</td><td>等 FA v4 (2025 末) 或 CUTLASS 实现</td></tr>
+      <tr><td>1M+ context 训练</td><td>Ring Attention + NVSHMEM</td></tr>
+      <tr><td>线性 / Mamba</td><td>Mamba ssm CUDA / Lightning Attention 自带 kernel</td></tr>
+      <tr><td>研究新 attention</td><td>FlexAttention 原型 → Triton → ThunderKittens</td></tr>
+    </table>
+
+    <h2>12.11 常见坑</h2>
+    <ul>
+      <li>online softmax 的 rescale 漏掉 → output 看起来正常但量级错</li>
+      <li>causal mask 在 tile 边界算错（应该 j_global &gt; i_global 而非 j_local）</li>
+      <li>shared 数组超 48 KB → 需 cudaFuncSetAttribute 解锁</li>
+      <li>fp16 累加 → 长序列下数值崩</li>
+      <li>PagedAttention block_table 越界 → illegal memory access；block_size 必须是 16 倍数对齐</li>
+      <li>GQA 时 K/V head 索引算错 (n_head / n_head_kv 整除) → 输出乱</li>
+      <li>sliding window + causal mask 双重判断写颠倒 → 边界 attend 错误</li>
+      <li>FA v3 warp specialization 时 producer/consumer warp 数比例错 → producer 太少跑不饱 consumer</li>
+      <li>FlashInfer 配 KV layout 时 NHD vs HND 选错 → 性能 -30% 或正确性失败</li>
+      <li>FlexAttention score_mod 用 Python 闭包变量 → 每次 launch 都 recompile, 慢死</li>
+    </ul>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch11-attention/index.html"><span class="label">上一章</span>← 11 · Attention 入门</a>
+      <a class="next" href="../ch13-llm-parts/index.html"><span class="label">下一章</span>13 · LLM 必备零件 →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body></html>

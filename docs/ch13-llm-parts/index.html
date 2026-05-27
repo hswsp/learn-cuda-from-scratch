@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 13 章 · LLM 必备零件</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head><body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol><li><a href="../ch01-intro/index.html">导论与环境</a></li><li><a href="../ch02-hello/index.html">Hello CUDA</a></li><li><a href="../ch03-threads/index.html">线程模型与索引</a></li><li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li></ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5"><li><a href="../ch05-memory/index.html">内存层级</a></li><li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li><li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li><li><a href="../ch08-async/index.html">性能分析与异步</a></li></ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9"><li><a href="../ch09-gemm/index.html">GEMM 深入</a></li><li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li><li><a href="../ch11-attention/index.html">Attention 入门</a></li><li><a href="../ch12-flashattn/index.html">FlashAttention</a></li><li><a href="../ch13-llm-parts/index.html" class="current">LLM 必备零件</a></li><li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li></ol>
+      <div class="stage">附录</div><ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 13 章 · LLM 必备零件</h1>
+    <div class="chapter-meta"><span>⏱️ 70 分钟</span><span>🎯 凑齐 Capstone 所需算子</span><span>📂 code/ch13_llm_parts/</span></div>
+
+    <p>本章拼齐<strong>第 14 章 Capstone</strong> 还差的算子。每个独立、简单，但少一个就跑不起来一个完整 LLM。</p>
+
+    <h2 id="rope">13.1 RoPE — Rotary Position Embedding</h2>
+    <p>Llama / Mistral / Qwen 都用 RoPE 替代了 GPT-2 的绝对位置编码。
+       它把 Q、K 向量看成 D/2 个复数，第 i 对复数乘以 <code>exp(j · θ_{t,i})</code>，其中
+       <code>θ_{t,i} = t / base^{2i/D}</code>。</p>
+
+    <h3>实现（in-place）</h3>
+<pre><code class="language-cpp">__global__ void rope_inplace(float* x, int T, int D, float base) {
+    int t = blockIdx.x;
+    int i = threadIdx.x;
+    int half = D / 2;
+    float theta = float(t) / powf(base, float(2*i) / float(D));
+    float c = cosf(theta), s = sinf(theta);
+    float x0 = x[t*D + i];
+    float x1 = x[t*D + i + half];
+    x[t*D + i       ] = x0 * c - x1 * s;
+    x[t*D + i + half] = x0 * s + x1 * c;
+}</code></pre>
+    <p>性质：</p>
+    <ul>
+      <li>不需要新增可学习参数</li>
+      <li>"相对位置"可以通过 <code>q^T_t · k_s</code> 的内积自动浮现</li>
+      <li>可通过加大 base 或 NTK-aware 缩放<strong>外推</strong>到更长 context（Llama 2 → Llama 3 = 8K → 128K 就靠这个）</li>
+    </ul>
+
+    <h2 id="swiglu">13.2 SwiGLU / SiLU — Llama FFN</h2>
+    <p>GPT-2 用 <code>FFN(x) = GELU(x @ W_1) @ W_2</code>。
+       Llama 用<strong>双投影 + 门控</strong>的 SwiGLU：</p>
+<pre><code>FFN(x) = ( SiLU(x @ W_gate) ⊙ (x @ W_up) ) @ W_down</code></pre>
+
+    <p>SiLU 定义：<code>silu(x) = x · sigmoid(x) = x / (1 + e^{-x})</code></p>
+<pre><code class="language-cpp">__device__ float silu(float x) {
+    return x * (1.f / (1.f + __expf(-x)));
+}
+
+__global__ void swiglu(const float* G, const float* U, float* O, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) O[i] = silu(G[i]) * U[i];
+}</code></pre>
+
+    <p>"门控"让网络学会"对某些位置让信息通过、对另一些抑制"。代价：FFN 多一个 W_gate，参数量 ~1.5×；但 hidden = 2.66·D（GPT-2 是 4·D），总参数差不多。</p>
+
+    <h2 id="kv-cache">13.3 KV Cache</h2>
+    <p>自回归生成有个关键观察：第 t 步生成的 token i 时，第 t-1 步算出来的 K、V 仍然有效，<strong>不必重算</strong>。
+       于是推理代码维护一个 cache：</p>
+<pre><code>K_cache shape: (n_layers, n_heads, T_max, D_head)
+V_cache shape: same</code></pre>
+
+    <p>每步只算新 token 的 (K_new, V_new) 形状 (1, D_head)，append 到 t_pos 位置：</p>
+<pre><code class="language-cpp">__global__ void append_kv(const float* K_new, const float* V_new,
+                          float* K_cache, float* V_cache, int t_pos, int D) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d &lt; D) {
+        K_cache[t_pos * D + d] = K_new[d];
+        V_cache[t_pos * D + d] = V_new[d];
+    }
+}</code></pre>
+
+    <h3>KV cache 的显存开销</h3>
+    <p>Llama-7B (n_layers=32, n_heads=32, D_head=128, fp16) 一个 token 的 KV 占 <strong>32 × 32 × 128 × 2 × 2 B = 0.5 MB</strong>。
+       T=2048 时 1 GB；batch=8、T=2048 → 8 GB。这就是为什么 KV cache 管理（PagedAttention 等）这么重要。</p>
+
+    <h2 id="sampling">13.4 Sampling 策略</h2>
+
+    <h3>greedy (argmax)</h3>
+<pre><code class="language-cpp">// 简化: V <= 65536 用单 block reduce 即可
+template &lt;int BLOCK&gt;
+__global__ void greedy_argmax(const float* logits, int* out, int V) {
+    __shared__ float vals[BLOCK]; __shared__ int idxs[BLOCK];
+    float bv = -INF; int bi = -1;
+    for (int i = tid; i &lt; V; i += BLOCK)
+        if (logits[i] &gt; bv) { bv = logits[i]; bi = i; }
+    /* block-wide reduce on (vals, idxs) keeping max */
+    if (tid == 0) *out = idxs[0];
+}</code></pre>
+
+    <h3>top-k (truncated sampling)</h3>
+    <p>从 logits 取最大的 k 个，softmax，按概率抽样。常见 k = 40~50。GPU 实现：用 block-wide top-k（heap 或 partial sort）。</p>
+
+    <h3>top-p (nucleus sampling)</h3>
+    <p>排序 logits → 累计概率 → 截断到累积 ≥ p 的前缀（典型 p = 0.9~0.95）→ 重新归一 → 抽样。需要 sort + prefix scan，第 7 章的 scan 模板在这里能复用。</p>
+
+    <h3>temperature</h3>
+    <p><code>logits /= T</code>，T &gt; 1 让分布更平（更随机），T &lt; 1 让分布更尖（更确定）。在 softmax 前应用。</p>
+
+    <table>
+      <tr><th>策略</th><th>速度</th><th>多样性</th><th>用途</th></tr>
+      <tr><td>greedy</td><td>最快</td><td>最低</td><td>评测、确定性回放</td></tr>
+      <tr><td>top-k</td><td>中等</td><td>中等</td><td>chat, 一般生成</td></tr>
+      <tr><td>top-p</td><td>稍慢</td><td>较高</td><td>chat, 创意写作</td></tr>
+      <tr><td>temperature only</td><td>快</td><td>可调</td><td>组合用</td></tr>
+    </table>
+
+    <h2>13.5 自检</h2>
+    <details><summary>Q1: RoPE 为什么 in-place 还能正确？</summary><p>因为旋转是 pair-wise (x0, x_{D/2}) ↔ (x0', x_{D/2}')，写入新位置时旧的两个值都还在寄存器里（在 kernel 内已加载），所以 in-place 安全。</p></details>
+    <details><summary>Q2: KV cache 为什么放 GPU 显存而不是 CPU？</summary><p>attention 算 (Q_new @ K_cache^T) 要把 K_cache 全部读进 SM。放 CPU 每步都得 H2D，PCIe 慢 10×。所以 KV cache 是 LLM 显存大户。</p></details>
+    <details><summary>Q3: SwiGLU 比 GELU 强多少？</summary><p>不算"强很多"。Llama 团队论文报告 +0.3 PPL 左右改善。但因为<strong>没坏处+实现简单</strong>，新模型都默认用它。</p></details>
+    <details><summary>Q4: top-p 排序很贵吗？</summary><p>V=50K 完整排序确实贵。优化套路：先 top-k (k=200) 截断再排序；或者 radix-select。vLLM 实现 ~50 us / token，可接受。</p></details>
+    <details><summary>Q5: prefill 和 decode 在 KV cache 上有什么区别？</summary><p>prefill（处理 prompt）：一次性算 T_prompt 个 KV 写 cache，是大 batch GEMM；decode：每步只算 1 个 KV，是 GEMV（memory-bound）。所以 LLM 服务把两者分开调度。</p></details>
+
+    <h2>13.6 练习</h2>
+    <ol>
+      <li>实现 <strong>top-k sampling</strong>：先 block-wide top-k（用堆），再 softmax 抽样。</li>
+      <li>实现 <strong>top-p (nucleus)</strong>：sort + scan + 截断。</li>
+      <li>给 <code>rope.cu</code> 加 <code>theta_base = 500000</code>（Llama 3 用），看长 T 时角度变化。</li>
+      <li>把 <code>swiglu</code> 改成 fused：把 silu(G) * U 合并到 W_down 的 GEMM 里（pre-multiplier trick）。</li>
+    </ol>
+
+    <h2 id="industry">13.7 工业实战：量化、投机解码、采样工程</h2>
+
+    <h3>13.7.1 W4A16 量化 — LLM 推理头号加速武器</h3>
+
+    <p>LLM decode 阶段瓶颈是<strong>权重的 HBM 读带宽</strong>（M=1 时 FLOPs 极少）。
+       Llama-7B fp16 权重 14 GB / A100 HBM 1.5 TB/s = 单步至少 9 ms。
+       把权重压成 INT4，HBM 读量降 4× → 单步 2-3 ms。这就是 W4A16（W=int4，A=fp16）。</p>
+
+    <table>
+      <tr><th>算法</th><th>思路</th><th>精度损失</th><th>实现</th></tr>
+      <tr><td>GPTQ</td><td>逐层 OBS 找量化误差最小的舍入</td><td>&lt; 0.5 PPL</td><td>AutoGPTQ</td></tr>
+      <tr><td>AWQ</td><td>activation-aware: 保护"重要"通道</td><td>&lt; 0.3 PPL</td><td>llm-awq, vLLM</td></tr>
+      <tr><td>GGUF</td><td>blockwise scale, k-means</td><td>0.2-0.8 PPL</td><td>llama.cpp</td></tr>
+      <tr><td>SmoothQuant</td><td>同时量化 W+A (W8A8)</td><td>~0.2 PPL</td><td>TensorRT-LLM</td></tr>
+    </table>
+
+    <h3>W4A16 kernel 的关键：dequant + GEMM 融合</h3>
+
+    <p>朴素做法：先把 INT4 dequant 成 fp16 写回 HBM 再调常规 GEMM —— <strong>这样消除不了带宽瓶颈</strong>。<br>
+    正确做法：<strong>kernel 内即时 dequant</strong>，权重始终以 INT4 从 HBM 读：</p>
+
+<pre><code class="language-cpp">for (int kt = 0; kt &lt; K; kt += BK) {
+    // 1) HBM 只读 INT4 weight tile (BM*BK/2 字节, 2 个 INT4 / byte)
+    load_int4_to_shared(W_int4_tile, gmem_ptr);
+    // 2) shared 内 dequant: int4 -&gt; fp16, 乘 per-group scale
+    dequant_inplace(W_int4_tile, W_fp16_tile, scales[group_id]);
+    // 3) WMMA / mma.sync 用 fp16
+    wmma::mma_sync(acc, A_frag, B_frag, acc);
+}</code></pre>
+
+    <p>典型实现：TensorRT-LLM <code>weight_only_gemm</code>，vLLM 的 Marlin kernel。Marlin 在 4090 上 7B decode 跑到 200+ tok/s，几乎打满 HBM 带宽。</p>
+
+    <h3>13.7.2 投机解码 (Speculative Decoding)</h3>
+
+    <p><strong>用小模型快速生成 N 个候选 token，大模型一次性验证</strong>。接受多少多少出，拒绝就退回。</p>
+
+<pre class="mermaid">
+graph LR
+    Start["prompt"] --> Draft["draft model<br/>(TinyLlama 1B 等)<br/>快速 4-8 token"]
+    Draft --> Verify["target model<br/>(Llama 70B)<br/>一次前向算 5 个位置 logits"]
+    Verify --> Accept{"p_target / p_draft<br/>是否接受?"}
+    Accept -->|"接受"| Continue["输出, 继续 draft"]
+    Accept -->|"拒绝"| Resample["从拒绝位重采样, 退回 draft"]
+    Continue --> Draft
+    Resample --> Draft
+    style Draft fill:#f6f8fa,stroke:#0969da
+    style Verify fill:#f6f8fa,stroke:#1a7f37
+</pre>
+
+    <p>关键洞察：</p>
+    <ul>
+      <li>target model 一次 forward <strong>同时</strong>算 N 个位置 logits（沿 batch 维并行），<strong>跟单 token decode 相比只慢 1.2-1.5×</strong>（带宽差不多）</li>
+      <li>接受率 60-80% → 端到端 2-3× 加速</li>
+    </ul>
+
+    <p>draft model 候选：</p>
+    <ul>
+      <li>TinyLlama 1B（同架构小模型）</li>
+      <li>EAGLE（专门训的 draft head）</li>
+      <li>Medusa（多 head 并行预测）</li>
+      <li>n-gram cache（重复 token 直接命中）</li>
+    </ul>
+
+    <p>vLLM、TensorRT-LLM 都内置。EAGLE / Medusa 需要额外训练，n-gram 0 训练成本。</p>
+
+    <h3>13.7.3 生产 sampler — 不只是 argmax</h3>
+
+<pre><code class="language-cpp">// 完整 pipeline: logits -&gt; /temp -&gt; top-k -&gt; top-p -&gt; softmax -&gt; cuRAND 抽样
+__global__ void sample_kernel(float* logits, int V, float temp, int top_k, float top_p,
+                              unsigned int seed, int* out_token) {
+    // 1) 除 temperature
+    for (int i = tid; i &lt; V; i += BLOCK) logits[i] /= temp;
+    // 2) top-k: 保留最大 k 个, 其他 -inf  (block-wide heap 或 partial sort)
+    block_topk(logits, V, top_k);
+    // 3) softmax + inclusive scan + 找 top-p 截断点 + 重新归一
+    block_softmax(logits, V);
+    block_inclusive_scan(logits, V);
+    int cutoff = block_find_first_ge(logits, top_p);
+    // 4) 用 cuRAND 抽样
+    curandState s; curand_init(seed, tid, 0, &amp;s);
+    *out_token = sample_from_dist(logits, cutoff, curand_uniform(&amp;s));
+}</code></pre>
+
+    <p>性能：完整 sampling ~50 μs (V=50K)，decode 总耗时占 1-2%。</p>
+
+    <h3>13.7.4 KV cache 量化（int8 / fp8）</h3>
+
+    <p>权重量化外，KV cache 也可以量化。Llama-7B (B=32, T=2K) KV 占 32 GB → fp8 后 16 GB，<strong>batch 翻倍</strong>。</p>
+
+    <p>实现：<strong>per-group scale</strong>，attention kernel 内 load 时 dequant：</p>
+
+<pre><code class="language-cpp">// attn 读 K 时:
+int8_t k_i8 = K_cache_int8[t * D + d];
+half scale  = K_scales[t / GROUP_SIZE];          // 每 64 token 一个 scale
+half k      = __int2half_rn(k_i8) * scale;</code></pre>
+
+    <p>TensorRT-LLM 默认支持 fp8 KV，vLLM 0.3+ 也支持。<strong>陷阱</strong>：per-tensor scale 精度差，per-channel scale 调度复杂——生产用 per-group (group_size=64) 平衡。</p>
+
+    <h3>13.7.5 RoPE 工程注意点</h3>
+
+    <ul>
+      <li><strong>fuse 到 QKV proj</strong>：QKV GEMM 出来立即 RoPE，不要单起 kernel</li>
+      <li><strong>预计算 cos/sin 表</strong>：每步 forward 重算 <code>sin(t/base^(2i/D))</code> 浪费；服务启动时预计算 (T_max, D/2) 表存显存</li>
+      <li><strong>NTK-aware / YaRN scaling</strong>：base 从 10000 改 500000+，让模型外推到更长 context</li>
+      <li><strong>正确性测试</strong>：用 PyTorch <code>rotary_emb</code> 对拍，pair (偶位置, 奇位置) 必须严格对齐</li>
+    </ul>
+
+    <h3>13.7.6 推理优化优先级</h3>
+    <table>
+      <tr><th>优化</th><th>prefill 收益</th><th>decode 收益</th><th>实施难度</th></tr>
+      <tr><td>fp16 → fp8 weight</td><td>★★</td><td>★★★★</td><td>易</td></tr>
+      <tr><td>W4A16 量化</td><td>★</td><td>★★★★★</td><td>中</td></tr>
+      <tr><td>FlashAttention v2</td><td>★★★★★</td><td>★★★</td><td>易（用现成库）</td></tr>
+      <tr><td>PagedAttention</td><td>—</td><td>★★★★（吞吐）</td><td>中（vLLM）</td></tr>
+      <tr><td>Speculative decoding</td><td>—</td><td>★★★★</td><td>难</td></tr>
+      <tr><td>CUDA Graph</td><td>★</td><td>★★</td><td>易</td></tr>
+      <tr><td>Continuous batching</td><td>—</td><td>★★★★（吞吐）</td><td>难</td></tr>
+      <tr><td>fused norm + QKV</td><td>★</td><td>★★</td><td>中</td></tr>
+    </table>
+    <p>顺序建议：先用 vLLM/TRT-LLM 自动拿 80% 优化，再针对自己模型做 fp8 量化 / spec decoding 增量调优。</p>
+
+    <h2 id="frontier">13.8 研究前沿（2025-2026）：EAGLE-3、Lookahead、KV 压缩、W4A4 / FP4</h2>
+
+    <h3>13.8.1 投机解码 2024-2026 演进</h3>
+
+    <table>
+      <tr><th>方法</th><th>原理</th><th>典型加速</th><th>实现成本</th></tr>
+      <tr><td>Vanilla SpecDec (2023)</td><td>独立小 draft model</td><td>2-3×</td><td>需训练 draft</td></tr>
+      <tr><td>Medusa（2024）</td><td>大模型加多个并行 head 直接预测后 N token</td><td>2-3×</td><td>微调 + head 训练</td></tr>
+      <tr><td><strong>EAGLE</strong>（ICML 2024）</td><td>用大模型 hidden state 作为 draft head 输入</td><td>3×</td><td>训练 draft head</td></tr>
+      <tr><td><strong>EAGLE-2</strong>（2024）</td><td>动态接受树, 不是固定 chain</td><td>~4×</td><td>同 EAGLE</td></tr>
+      <tr><td><strong>EAGLE-3</strong>（2025）</td><td>更深 draft head, 多层 hidden 输入</td><td>~5-6×</td><td>同 EAGLE</td></tr>
+      <tr><td><strong>Lookahead Decoding</strong>（Hao Zhang 团队 2024）</td><td>用 Jacobi 迭代 + n-gram cache, <strong>无需训练</strong></td><td>2-4×</td><td>0 训练</td></tr>
+      <tr><td><strong>Hydra</strong>（2024）</td><td>多 head 串行依赖, 比 Medusa 接受率高</td><td>~3-4×</td><td>训练</td></tr>
+      <tr><td><strong>ReDrafter</strong>（Apple 2024）</td><td>RNN draft + Top-K beam, 上线 LLM Engine</td><td>~3×</td><td>训练</td></tr>
+    </table>
+
+    <p><strong>2026 工业现实</strong>：</p>
+    <ul>
+      <li>vLLM / TRT-LLM 默认开 <strong>EAGLE-2 / Medusa-2</strong></li>
+      <li>不愿意训 draft 的接 <strong>Lookahead</strong>（n-gram 命中率随 prompt 类型变化大）</li>
+      <li>Reasoning 模型（o1/R1）由于 thinking 重复模式多，<strong>Lookahead 收益尤其大</strong>（n-gram 命中 50%+）</li>
+    </ul>
+
+    <h3>13.8.2 KV cache 压缩前沿（2024-2026）</h3>
+
+    <p>除了 13.7.4 的量化路线，2024-2026 出现了大量"丢 token"型压缩：</p>
+
+    <table>
+      <tr><th>方法</th><th>核心想法</th><th>压缩比</th><th>精度损失</th></tr>
+      <tr><td><strong>StreamingLLM</strong>（ICLR 2024）</td><td>保留 sink token + 最近 W token</td><td>10-50×</td><td>无损（短 attention）</td></tr>
+      <tr><td><strong>H2O (Heavy-Hitter Oracle)</strong></td><td>累计 attention score 高的 token 留</td><td>5-10×</td><td>&lt; 1 PPL</td></tr>
+      <tr><td><strong>SnapKV</strong>（NeurIPS 2024）</td><td>每层独立选 K/V 保留</td><td>5-10×</td><td>&lt; 0.5 PPL</td></tr>
+      <tr><td><strong>KIVI</strong>（ICML 2024）</td><td>K per-channel 量化, V per-token</td><td>4×（int2）</td><td>~0.3 PPL</td></tr>
+      <tr><td><strong>KV-Quant</strong></td><td>非均匀量化 + outlier 单独保留</td><td>4-8×</td><td>~0.5 PPL</td></tr>
+      <tr><td><strong>Quest</strong>（ICLR 2025）</td><td>查询时 page-level 选 top-k 块</td><td>取决于 sparsity</td><td>近无损</td></tr>
+      <tr><td><strong>L2Compress / MiniCache</strong></td><td>跨层 KV 合并</td><td>2-4×</td><td>~0.5 PPL</td></tr>
+    </table>
+
+    <p>组合：<strong>MLA + fp8 KV + SnapKV / Quest</strong> 是 DeepSeek-V3 / Kimi 等的工业实践，长 context 时 KV 显存从 GB 级降到几十 MB。</p>
+
+    <h3>13.8.3 W4A4 / NVFP4 — 极致量化（2024-2026）</h3>
+
+    <p>9.10.4 给了对比表，这里详述算法：</p>
+
+    <h4>QuaRot（ICML 2024）— Hadamard 旋转解 outlier</h4>
+    <p>激活的 outlier 是 W4A4 最大障碍（少数 channel 数值范围比平均大 100×）。QuaRot 用 Hadamard 矩阵 H 旋转：<code>x' = xH, w' = wH^T</code>，<strong>数学等价 + 旋转后分布更均匀，outlier 被打散</strong>。</p>
+
+    <h4>SpinQuant（Meta 2024）— 可学习旋转</h4>
+    <p>不用固定 Hadamard，训练学习旋转矩阵。精度比 QuaRot 再好 0.2-0.5 PPL。</p>
+
+    <h4>Atom（MLSys 2024）— 混合 W4A4 + Heuristic outlier</h4>
+    <p>正常 channel 用 INT4，outlier channel 单独留 INT8。fp16 baseline 之上无损。</p>
+
+    <h4>NVFP4（Blackwell 2025）— 硬件原生</h4>
+    <p>fp4 (E2M1) + per-16-block fp8 scale，<strong>Tensor Core 直接吞</strong>。无需 dequant 到 fp16/fp8 中转，吞吐拉满。是 2025+ B200 推理的<strong>事实标准</strong>。</p>
+
+    <h3>13.8.4 BitDelta / 1-bit weight diff</h3>
+
+    <p>BitDelta（Anthropic 2024）：<strong>把 fine-tuned 模型相对 base 的 diff 量化到 1 bit</strong>。</p>
+
+    <ul>
+      <li>base model (full fp16) 一份</li>
+      <li>每个 fine-tune 的 delta 只占 1 bit/param + scale</li>
+      <li>Llama-70B fine-tune 模型从 140 GB 缩到 ~9 GB + 1 GB</li>
+      <li>精度损失极小（&lt; 0.5 LR-bench）</li>
+    </ul>
+
+    <p>意义：<strong>多租户服务能存几百个 fine-tune 版本</strong>同时运行，每个只多花一点显存。Anthropic / Together AI / Fireworks 都在用。</p>
+
+    <h3>13.8.5 RoPE 长 context 外推：YaRN、PI、NTK</h3>
+
+    <p>原始 RoPE base=10000 训练长度内表现好，超出训练长度急剧退化。2023-2025 主要技术：</p>
+
+    <table>
+      <tr><th>技术</th><th>核心</th><th>典型外推</th></tr>
+      <tr><td>Position Interpolation (PI)</td><td>position 缩放</td><td>4×</td></tr>
+      <tr><td>NTK-aware</td><td>高频维度少缩、低频维度多缩</td><td>8×</td></tr>
+      <tr><td><strong>YaRN</strong>（ICLR 2024）</td><td>NTK-aware + 温度调整 + 部分维度不缩</td><td>16-32×</td></tr>
+      <tr><td><strong>Dynamic NTK</strong></td><td>推理时根据当前 T 动态调 base</td><td>10×+</td></tr>
+      <tr><td>LongRoPE（Microsoft 2024）</td><td>进化算法搜索 per-dim 缩放因子</td><td>32× (2M token)</td></tr>
+    </table>
+
+    <p>Llama 3 直接训练到 8K，推理用 YaRN 外推到 128K。Llama 4 据传训练到 32K，外推到 10M。<strong>不重训能让模型多用 10×+ context</strong>，性价比极高。</p>
+
+    <h3>13.8.6 Reasoning 模型的采样新需求</h3>
+
+    <p>o1 / R1 类 reasoning 模型，<strong>采样策略</strong>影响最终能力：</p>
+
+    <ul>
+      <li><strong>多次采样 + 投票 (best-of-N, BoN)</strong>：同一 prompt 跑 N 次, 选 reward 最高的。N=64 是常见 ceiling</li>
+      <li><strong>Self-Consistency</strong>：跑多次, 答案投票</li>
+      <li><strong>Process Reward Model (PRM)</strong>：用专门的 reward model 给中间 thinking 打分, 引导更好的路径</li>
+      <li><strong>Beam Search 复兴</strong>：reasoning 模型的 thinking 路径有"枝", beam 重新有意义</li>
+      <li><strong>MCTS</strong>（Monte Carlo Tree Search）：DeepSeek-R1 等用类似思路在 thinking 期间探索</li>
+    </ul>
+
+    <p>对 sampler kernel 的影响：<strong>不再是单 next-token argmax</strong>，而是 N 个并行候选 + reward model 评估 + 选择，<strong>采样跟 attention 计算量同阶</strong>。</p>
+
+    <h3>13.8.7 2026 LLM 算子优化总览</h3>
+
+    <table>
+      <tr><th>技术</th><th>对 7B fp16 baseline 提升</th></tr>
+      <tr><td>FA v3 + Hopper</td><td>2-3×</td></tr>
+      <tr><td>NVFP4 + Blackwell</td><td>再 4-6×</td></tr>
+      <tr><td>MLA（如果模型用）</td><td>KV 显存 7×, batch 也大 7×</td></tr>
+      <tr><td>EAGLE-3</td><td>5-6×（decode）</td></tr>
+      <tr><td>Lookahead decoding</td><td>2-4×（无训练）</td></tr>
+      <tr><td>PagedAttention + RadixAttention</td><td>1.5-3× 吞吐</td></tr>
+      <tr><td>Chunked prefill</td><td>~1.5× latency</td></tr>
+      <tr><td>Disaggregated serving</td><td>~1.5× tokens/$</td></tr>
+    </table>
+
+    <p><strong>所有技术叠加</strong>：相比 2023 baseline，2026 LLM 推理性价比提升 ~50-100×。这就是为什么 LLM 服务价格在两年内能降 100×（GPT-3.5 → DeepSeek-V3 同等性能 API 价格差 100 倍）。</p>
+
+    <h2>13.9 常见坑</h2>
+    <ul>
+      <li>RoPE pair 索引写错（<code>i + half</code> 和 <code>i</code> 颠倒）→ Q/K 一致地坏，模型仍能跑但精度差</li>
+      <li>KV cache 越界写（t_pos &gt; T_max）→ illegal memory access</li>
+      <li>greedy argmax 在 V 不是 BLOCK 倍数时漏元素 → 偶发概率错</li>
+      <li>temperature = 0 → 除零，应改为 greedy 分支</li>
+      <li>W4A16 用错 scale layout（per-tensor vs per-group）→ 数值崩，模型胡言乱语</li>
+      <li>投机解码 draft 模型没用同 tokenizer → 投机 token id 跟 target 对不上</li>
+      <li>top-p 排序对 V=128K 词表过慢 → 用 radix-select 或先 top-k 截断到 1000 再 top-p</li>
+      <li>fp8 KV cache 用 per-tensor scale → 长 T 时精度损失明显，必须 per-group</li>
+      <li>EAGLE / Medusa 跟原模型不同 tokenizer 或 vocab → 投机一直被拒, 反而拖慢</li>
+      <li>Lookahead n-gram cache 不清理 → 跨请求污染，输出错乱</li>
+      <li>YaRN 配置忘了应用到 model 加载时, 只在 inference 阶段调 base → RoPE 实际没变</li>
+      <li>BitDelta 用错 base model 版本（如 Llama-2 vs Llama-2-chat） → 解出来全是噪声</li>
+    </ul>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch12-flashattn/index.html"><span class="label">上一章</span>← 12 · FlashAttention</a>
+      <a class="next" href="../ch14-mini-llm/index.html"><span class="label">下一章</span>14 · Capstone Mini-LLM →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body></html>

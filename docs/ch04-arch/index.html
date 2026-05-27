@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 4 章 · GPU 硬件架构</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head><body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol><li><a href="../ch01-intro/index.html">导论与环境</a></li><li><a href="../ch02-hello/index.html">Hello CUDA</a></li><li><a href="../ch03-threads/index.html">线程模型与索引</a></li><li><a href="../ch04-arch/index.html" class="current">GPU 硬件架构</a></li></ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5"><li><a href="../ch05-memory/index.html">内存层级</a></li><li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li><li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li><li><a href="../ch08-async/index.html">性能分析与异步</a></li></ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9"><li><a href="../ch09-gemm/index.html">GEMM 深入</a></li><li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li><li><a href="../ch11-attention/index.html">Attention 入门</a></li><li><a href="../ch12-flashattn/index.html">FlashAttention</a></li><li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li><li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li></ol>
+      <div class="stage">附录</div><ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+  <main>
+    <h1>第 4 章 · GPU 硬件架构</h1>
+    <div class="chapter-meta"><span>⏱️ 50 分钟</span><span>🎯 看懂 SM 内部</span><span>📂 code/ch04_arch/</span></div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>理解 SM 内部结构：CUDA core / Tensor Core / 寄存器堆 / shared mem</li>
+      <li>掌握 <span class="term" data-en="SIMT">SIMT</span> 执行模型与 <span class="term" data-en="warp divergence">warp divergence</span></li>
+      <li>明白什么是 <span class="term" data-en="occupancy">占用率</span>、什么因素决定占用率</li>
+      <li>看完知道 Volta → Ampere → Hopper 在 Tensor Core 上的演进</li>
+    </ul>
+
+    <h2>4.1 SM 解剖图</h2>
+    <p>A100 (Ampere) 上有 108 个 SM，每个 SM 内部长这样：</p>
+    <img src="../assets/diagrams/sm.svg" alt="SM 内部结构图" style="width:100%; max-width:780px">
+    <noscript><p>（如果看不到 SVG 图，请用浏览器直接打开 <a href="../assets/diagrams/sm.svg">sm.svg</a>）</p></noscript>
+
+    <p>关键数字（A100 / sm_80）：</p>
+    <table>
+      <tr><th>资源</th><th>每 SM</th><th>说明</th></tr>
+      <tr><td>FP32 CUDA core</td><td>64</td><td>每周期吐 64 个 FP32 FMA</td></tr>
+      <tr><td>FP64 CUDA core</td><td>32</td><td>科学计算用</td></tr>
+      <tr><td>Tensor Core</td><td>4 (3rd gen)</td><td>主战场：fp16/bf16/tf32/int8 矩阵乘</td></tr>
+      <tr><td>寄存器 (32-bit)</td><td>65536</td><td>所有驻留 thread 平分</td></tr>
+      <tr><td>Shared mem + L1</td><td>192 KB</td><td>可配置分割比例</td></tr>
+      <tr><td>Max threads</td><td>2048 (64 warps)</td><td>同时驻留的上限</td></tr>
+    </table>
+
+    <h2>4.2 SIMT 执行模型</h2>
+    <p>SM 调度的最小单位不是 thread 而是 <strong>warp = 32 个 thread</strong>。warp 内 32 个 thread<strong>同步执行同一条指令</strong>但操作不同的数据（寄存器/内存地址）。这就是 SIMT (Single Instruction Multiple Threads)。</p>
+
+<pre class="mermaid">
+graph LR
+    PC["Program Counter"] --> Decode["Decode"]
+    Decode -->|"1 cycle"| Disp["Dispatch"]
+    Disp --> T0(("T0"))
+    Disp --> T1(("T1"))
+    Disp --> T2(("T2"))
+    Disp --> Tn(("... T31"))
+    style PC fill:#f6f8fa,stroke:#0969da
+    style Disp fill:#f6f8fa,stroke:#1a7f37
+</pre>
+
+    <p>SM 同时持有多个 warp（最多 64 个）。每周期硬件挑一个 ready 的 warp 发射指令。
+       <strong>当某个 warp 在等 global memory（几百周期），SM 切到别的 warp 干活</strong>——这就是"GPU 用并行隐藏延迟"。</p>
+
+    <h2 id="divergence">4.3 Warp Divergence — 同 warp 走两条路</h2>
+    <p>如果 warp 内 32 个 thread 走了 if/else 两支：</p>
+<pre><code class="language-cpp">if (threadIdx.x &amp; 1) {        // 偶数 lane 走 else，奇数 lane 走 if
+    x = x * 2;
+} else {
+    x = x + 1;
+}</code></pre>
+    <p>硬件没办法同时执行两条不同的指令，所以它<strong>串行</strong>跑两遍：先让走 if 的 lane 干活（else 的 lane 掩码屏蔽），再切到 else 的 lane。代价 = 两支的耗时之和。</p>
+
+    <p>实测：跑 <a href="../../code/ch04_arch/warp_divergence.cu">warp_divergence.cu</a>（T4 典型输出）：</p>
+<pre><code>uniform   (warp-aligned branch) : 5.412 ms
+divergent (lane-aligned branch) : 10.873 ms
+slowdown                        : 2.01x</code></pre>
+
+    <p>差不多刚好 2 倍——因为两支几乎等长。如果 if 的工作量远大于 else，divergent 损失会更隐蔽（执行时间被 if 主导，不再是简单的 2×）。</p>
+
+    <div class="callout">
+      <strong>💡 规避策略：</strong> 让分支条件与 <code>threadIdx.x / 32</code>（warp id）对齐，或者干脆用 <code>?:</code> 让两边都算然后选一个（前提是两边都很便宜）。在 attention mask 这种场景里，常见做法是<strong>填 -∞</strong> 而不是 if-skip。
+    </div>
+
+    <h2 id="occupancy">4.4 Occupancy</h2>
+    <p>定义：<strong>实际驻留 warp 数 / SM 最大支持 warp 数</strong>。高 occupancy 让 SM 有更多 warp 可以切换以隐藏延迟。</p>
+
+    <p>占用率受三个资源约束（取最严格的那个）：</p>
+    <ol>
+      <li><strong>线程数</strong>：block 大小 × block/SM 数 ≤ 2048（A100）</li>
+      <li><strong>寄存器</strong>：每 thread 用 N 个寄存器 → SM 上 64K/N 个 thread 上限</li>
+      <li><strong>Shared memory</strong>：每 block 用 M KB → SM 上 192/M 个 block 上限</li>
+    </ol>
+
+    <p>运行 <a href="../../code/ch04_arch/occupancy_probe.cu">occupancy_probe.cu</a>，CUDA Runtime 会替你算：</p>
+<pre><code>--- block = 256 ---
+  light_kernel    block= 256  active blocks/SM= 8  warps/SM=64/64  occ=100.0%
+  heavy_kernel    block= 256  active blocks/SM= 4  warps/SM=32/64  occ= 50.0%</code></pre>
+    <p>heavy_kernel 因为本地数组占了很多寄存器（编译器把 <code>float acc[64]</code> 放到了寄存器），SM 上的驻留 block 数被腰斩。</p>
+
+    <div class="callout warn">
+      <strong>⚠️ 高 occupancy ≠ 高性能。</strong>
+      Volta 之后的架构有 ILP（指令级并行）和大寄存器优化，很多高性能 kernel 只跑 25-50% occupancy。
+      FlashAttention v2 就是典型——故意用大量寄存器换更少的内存访问。
+    </div>
+
+    <h2>4.5 架构演进 (5 分钟扫盲)</h2>
+    <table>
+      <tr><th>架构</th><th>SM</th><th>关键创新</th><th>Tensor Core</th><th>典型卡</th></tr>
+      <tr><td>Volta</td><td>sm_70</td><td>引入 Tensor Core (fp16 MMA)</td><td>1st gen, 64 FMA/cycle</td><td>V100</td></tr>
+      <tr><td>Turing</td><td>sm_75</td><td>消费级 TC，加 int8/int4</td><td>2nd gen</td><td>T4 / RTX 20</td></tr>
+      <tr><td>Ampere</td><td>sm_80/86</td><td>tf32, bf16, async copy (<code>cp.async</code>), 稀疏</td><td>3rd gen, 256 FMA/cycle</td><td>A100, RTX 30</td></tr>
+      <tr><td>Ada</td><td>sm_89</td><td>FP8 (E4M3/E5M2), SER</td><td>4th gen</td><td>L40, RTX 40</td></tr>
+      <tr><td>Hopper</td><td>sm_90</td><td>TMA (硬件张量加载), DPX, async warpgroup MMA, 分布式共享内存</td><td>4th gen</td><td>H100</td></tr>
+      <tr><td>Blackwell</td><td>sm_100</td><td>FP4, 第二代 Transformer Engine</td><td>5th gen</td><td>B100/B200</td></tr>
+    </table>
+
+    <p>对 LLM 推理重要程度（粗略）：</p>
+    <ul>
+      <li><strong>Tensor Core</strong>（Volta 起）→ GEMM 加速 8×+</li>
+      <li><strong>bf16</strong>（Ampere）→ 训练 / 推理动态范围大</li>
+      <li><strong><code>cp.async</code></strong>（Ampere）→ 让 shared memory 加载与计算重叠，FlashAttention 的基础</li>
+      <li><strong>FP8</strong>（Hopper/Ada）→ 推理吞吐再翻倍</li>
+      <li><strong>TMA</strong>（Hopper）→ kernel 不再手写 load 循环，硬件批量搬运 tile</li>
+    </ul>
+
+    <h2 id="industry">4.6 工业实战：MIG、ECC、功耗管理</h2>
+
+    <p>把 GPU 上线到生产，光会写 kernel 不够，还要会调"GPU 设置"。这一节是数据中心运维必备。</p>
+
+    <h3>4.6.1 MIG (Multi-Instance GPU) — 一卡当七卡用</h3>
+
+    <p>A100 / H100 / H200 支持把一张 GPU 切成最多 7 个独立的"小 GPU"（叫 MIG instance），每个有独立 SM、独立显存、独立 cache。<strong>用途</strong>：多租户推理服务，让小模型共享大卡。</p>
+
+<pre><code class="language-bash"># 1) 启用 MIG 模式 (需要 root + 没人在用 GPU)
+sudo nvidia-smi -mig 1
+
+# 2) 创建 MIG instances (A100-40G 可切 1g.5gb × 7)
+sudo nvidia-smi mig -cgi 19,19,19,19,19,19,19 -C
+#                      ^^^ profile id, 19 = 1g.5gb
+
+# 3) 看现在的切片
+nvidia-smi -L
+# GPU 0: NVIDIA A100-SXM4-40GB
+#   MIG 1g.5gb     Device 0: (UUID: MIG-...)
+#   MIG 1g.5gb     Device 1: (UUID: MIG-...)
+#   ...
+
+# 4) 关 MIG 模式
+sudo nvidia-smi -mig 0</code></pre>
+
+    <table>
+      <tr><th>profile</th><th>SM 比例</th><th>显存</th><th>典型用途</th></tr>
+      <tr><td>1g.5gb</td><td>1/7 ≈ 14%</td><td>5 GB</td><td>BERT-base, 小推理</td></tr>
+      <tr><td>2g.10gb</td><td>2/7 ≈ 28%</td><td>10 GB</td><td>7B fp16 推理</td></tr>
+      <tr><td>3g.20gb</td><td>3/7 ≈ 42%</td><td>20 GB</td><td>13B fp16</td></tr>
+      <tr><td>7g.40gb</td><td>1 (全卡)</td><td>40 GB</td><td>整卡训练</td></tr>
+    </table>
+
+    <p><strong>陷阱</strong>：MIG 开启后，<code>cudaGetDeviceCount</code> 返回的是 MIG instance 数而不是物理 GPU 数；代码看到的算力是切片大小，跟物理 GPU 不一样。新手调试半天找不到原因，记得 <code>nvidia-smi -L</code> 看现在到底切了没。</p>
+
+    <h3>4.6.2 ECC — 单 bit 翻转保护</h3>
+
+    <p>数据中心 GPU 默认开 ECC（错误检测与纠正）。它给每 64 bit 数据加 8 bit 校验，能纠 1 bit 错误、检测 2 bit 错误。代价：</p>
+    <ul>
+      <li>显存少 ~6%（A100-80G 实际可用 ~76 GB）</li>
+      <li>HBM 带宽降 ~5%（要传校验位）</li>
+      <li>极小幅算力影响（&lt; 2%）</li>
+    </ul>
+
+<pre><code class="language-bash">nvidia-smi -e 0           # 关 ECC (需重启 GPU)
+nvidia-smi -e 1           # 开
+nvidia-smi -q -d ECC      # 查累计错误数
+# 关注:
+#   Volatile Single Bit ECC Errors  (本次启动后)
+#   Aggregate Single Bit ECC Errors (从出厂)</code></pre>
+
+    <p><strong>是否关 ECC</strong>：</p>
+    <ul>
+      <li>训练：<strong>必开</strong>。一次 bit 翻转可能让 loss NaN 浪费几小时。</li>
+      <li>推理：可关。bit 翻转影响一个 token 不致命。生产推理服务 80% 都关，多 ~5GB 显存。</li>
+      <li>看到 Volatile Single Bit Errors &gt; 0：观察增长率，&gt; 100/天 该送修。</li>
+    </ul>
+
+    <h3>4.6.3 功耗与时钟管理</h3>
+
+    <p>GPU 默认<strong>动态调频</strong>：温度高就降频、负载低就降频。生产服务希望延迟稳定，常用做法是<strong>锁定时钟</strong>：</p>
+
+<pre><code class="language-bash"># 查支持的时钟
+nvidia-smi -q -d SUPPORTED_CLOCKS | head -40
+
+# 锁定 GPU 时钟到 1410 MHz, mem 1215 MHz (A100 典型最大)
+sudo nvidia-smi -ac 1215,1410
+
+# 锁定功耗墙到 300W (默认 400W, 省电用)
+sudo nvidia-smi -pl 300
+
+# 解锁
+sudo nvidia-smi -rac
+sudo nvidia-smi -rgc</code></pre>
+
+    <p>锁频后 benchmark 数字更稳定（消除 thermal throttling 的抖动），适合 CI 性能回归测试。</p>
+
+    <h3>4.6.4 nvidia-smi 读图：理解每列</h3>
+
+<pre><code>+---------------------------------------------------------------------------------------+
+| NVIDIA-SMI 535.86.05    Driver Version: 535.86.05    CUDA Version: 12.2     |   ← 驱动 + 驱动支持的最高 CUDA
+|-----------------------------------------+----------------------+----------------------+
+| GPU  Name        Persistence-M | Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp  Perf  Pwr:Usage/Cap |         Memory-Usage | GPU-Util  Compute M. |
+|                                |                      |               MIG M. |
+|=========================================+======================+======================|
+|   0  NVIDIA A100-SXM...  On    | 00000000:00:04.0 Off |                    0 |
+| N/A   42C    P0    72W / 400W  |   1234MiB / 81920MiB |     45%      Default |
+|                                |                      |             Disabled |
++-----------------------------------------+----------------------+----------------------+
+
+要关注的字段:
+- Persistence-M = On    省每次 cuInit 的 ~3 秒延迟 (生产服务必开: sudo nvidia-smi -pm 1)
+- Pwr 72W/400W         功耗远低于 cap → mem-bound 或 launch 等
+- 1234MiB/81920MiB     显存占用 (有时是其他进程, nvidia-smi 看不到 driver 占用)
+- GPU-Util 45%         <strong>注意陷阱: 100% 不代表算力跑满</strong>
+- MIG M. Disabled      MIG 未开</code></pre>
+
+    <p>看进程占了多少：</p>
+<pre><code class="language-bash">nvidia-smi pmon -i 0 -d 1     # 每秒打印每进程的 sm/mem/enc/dec util
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv</code></pre>
+
+    <h3>4.6.5 各代 GPU 在 LLM 工业部署中的定位</h3>
+
+    <table>
+      <tr><th>架构</th><th>代表卡</th><th>对 LLM 关键能力</th><th>2025 现状</th></tr>
+      <tr><td>Volta sm_70</td><td>V100</td><td>第一代 TC, 只有 fp16</td><td>已淘汰, 偶见 EC2 老机型</td></tr>
+      <tr><td>Turing sm_75</td><td>T4 / RTX 20</td><td>TC + int8, 16 GB</td><td>Colab 免费 / 边缘推理</td></tr>
+      <tr><td>Ampere sm_80</td><td>A100</td><td><strong>cp.async / bf16 / tf32</strong>, 40-80 GB</td><td>训练 / 推理主力, 性价比之王</td></tr>
+      <tr><td>Ampere sm_86</td><td>A10 / RTX 30</td><td>fp16 TC 大幅强化</td><td>推理中端</td></tr>
+      <tr><td>Ada sm_89</td><td>L40S / RTX 4090</td><td><strong>FP8</strong> + 更多 fp16 算力</td><td>消费推理 / 边缘</td></tr>
+      <tr><td>Hopper sm_90</td><td>H100 / H200</td><td><strong>TMA / wgmma / DPX / Transformer Engine</strong></td><td>训练顶配, 长 context 推理</td></tr>
+      <tr><td>Blackwell sm_100</td><td>B100 / B200 / GB200</td><td><strong>FP4</strong> / TC 第 5 代</td><td>2025 起最新</td></tr>
+    </table>
+
+    <p><strong>对 LLM 推理来说最大的几次跳跃</strong>：</p>
+    <ol>
+      <li>Volta → Turing：消费端有了 TC，inference 落地变现实</li>
+      <li>Turing → Ampere：cp.async 让 FlashAttention 成为可能</li>
+      <li>Ampere → Hopper：TMA + Transformer Engine + fp8 让 100B+ 模型可服务</li>
+      <li>Hopper → Blackwell：fp4 让超大模型推理成本再降 2-3×</li>
+    </ol>
+
+    <p>选 GPU 的时候，对应到你的模型规模和 latency 要求查上表。</p>
+
+    <h2 id="frontier">4.7 研究前沿（2025-2026）：Blackwell 解剖</h2>
+
+    <h3>4.7.1 Blackwell B200 关键特性</h3>
+
+    <p>Blackwell（sm_100）是 Hopper 之后的下一代，2024 末发布，2025 大规模量产。结构变化比 Ampere→Hopper 更激进：</p>
+
+    <table>
+      <tr><th>特性</th><th>Hopper (H100)</th><th>Blackwell (B200)</th><th>变化</th></tr>
+      <tr><td>制程</td><td>TSMC 4N</td><td>TSMC 4NP, <strong>dual-die</strong></td><td>双 die 通过 NV-HBI 10 TB/s 互联</td></tr>
+      <tr><td>晶体管</td><td>80B</td><td>208B（2 die 各 104B）</td><td>2.6×</td></tr>
+      <tr><td>SM 数</td><td>132</td><td>148 (× 2 die = 296)</td><td>2.2× 总数</td></tr>
+      <tr><td>HBM</td><td>80 GB HBM3</td><td>192 GB HBM3e</td><td>容量 2.4×, 带宽 1.7×</td></tr>
+      <tr><td>HBM 带宽</td><td>3.4 TB/s</td><td>8 TB/s</td><td>对 LLM decode 是巨大利好</td></tr>
+      <tr><td>fp16 TC 算力</td><td>989 TF</td><td>2250 TF</td><td>2.3×</td></tr>
+      <tr><td>fp8 TC 算力</td><td>1979 TF</td><td>4500 TF</td><td>2.3×</td></tr>
+      <tr><td>fp4 TC 算力</td><td>无</td><td>9000 TF (=10 PF)</td><td>新增</td></tr>
+      <tr><td>Tensor Memory (TMEM)</td><td>无</td><td>每 SM 256 KB</td><td>新增（关键创新）</td></tr>
+      <tr><td>2nd-gen Transformer Engine</td><td>—</td><td>有</td><td>FP6 / FP4 / 动态精度</td></tr>
+      <tr><td>NVLink</td><td>NVLink 4, 900 GB/s</td><td>NVLink 5, 1800 GB/s</td><td>2× 跨卡带宽</td></tr>
+    </table>
+
+    <h3>4.7.2 Tensor Memory (TMEM) — Blackwell 最大改动</h3>
+
+    <p>Hopper 及之前所有 GPU 用一个统一的 register file 存 fragment / accumulator。Blackwell 把<strong>matrix accumulator 抽出来到一块独立的 SRAM</strong>（叫 TMEM）：</p>
+
+<pre><code>SM 内部 (Blackwell):
+  ┌─ Register file       ~64 K × 32-bit  (跟 Hopper 一样)
+  ├─ Shared / L1         ~228 KB         (跟 Hopper 一样)
+  ├─ <strong>Tensor Memory (TMEM)   256 KB          ← 新增, 专给 MMA accumulator</strong>
+  └─ Tensor Cores (5th gen) + Transformer Engine 2
+</code></pre>
+
+    <p><strong>动机</strong>：fp4 / fp8 MMA 的 accumulator 是 fp32，每个 MMA 要消耗几十个寄存器持有 acc。把 acc 放 TMEM 释放了寄存器给其他用途，让 ILP 大幅提升。</p>
+
+    <h3>用 TMEM 的新指令: TCGEN05</h3>
+
+<pre><code class="language-cpp">// PTX-level (CUTLASS 3.5+ 自动用)
+tcgen05.mma.async        // 异步 MMA, accumulator 写 TMEM
+tcgen05.ld               // 从 TMEM 读出 accumulator
+tcgen05.cp               // shared memory ↔ TMEM</code></pre>
+
+    <p>典型代码量： CUTLASS 已经全部封装，普通 kernel 开发者不用碰 PTX。但<strong>FlashAttention v4 / DeepSeek FlashMLA</strong> 等都直接用 TCGEN05 拿到 95%+ peak。</p>
+
+    <h3>4.7.3 2nd-gen Transformer Engine：动态精度</h3>
+
+    <p>Hopper 的 1st-gen TE 只能在 fp16 / fp8 之间切。Blackwell 的 2nd-gen 可以：</p>
+    <ul>
+      <li><strong>每个张量自动选 fp4 / fp6 / fp8</strong> 基于范围分析</li>
+      <li>支持 <strong>microscaling (block size 16/32)</strong> — 每 16/32 元素一个 scale，比 per-tensor scale 精度高</li>
+      <li>训练 / 推理都能用，<strong>DeepSeek-V3 部分用 fp8 训练</strong>就是同思路（虽然 V3 用的还是 Hopper）</li>
+    </ul>
+
+    <h3>4.7.4 GB200 与 NVL72：rack 即 GPU</h3>
+
+    <p>单 B200 已经很强，但 NVIDIA 的真正杀手锏是 <strong>NVL72</strong>：</p>
+
+<pre><code>1 个 GB200 = 1 Grace CPU + 2 Blackwell die (= 1 B200)
+1 NVL72 rack = 36 GB200 = 72 Blackwell die (称为"72 GPU"，但实际 36 物理 GPU 包)
+NVL72 内部: NVSwitch 5 全互联，每 GPU 1800 GB/s
+对外: 1.4 EF fp4 算力, 13.8 TB HBM, 30 TB CPU LPDDR5X</code></pre>
+
+    <p>能干什么：</p>
+    <ul>
+      <li>1.8T 参数 fp4 模型一柜推理（之前需要跨节点）</li>
+      <li>Llama 4 Behemoth 2T 训练，跨 rack 通信压力小</li>
+      <li>DeepSeek-V3 671B MoE TP=16 + EP=72，单柜服务</li>
+    </ul>
+
+    <h3>4.7.5 Rubin（2026 中后期）— 下一代</h3>
+
+    <p>NVIDIA 已公布 Rubin 路线图：</p>
+    <ul>
+      <li><strong>Rubin (R100, 2026)</strong>：3nm，HBM4，再一轮 ~2× 算力</li>
+      <li><strong>Rubin Ultra (R200, 2027)</strong>：4 die / GPU, ~8 PF fp4</li>
+      <li><strong>NVL576 整柜</strong>：训练顶级模型</li>
+    </ul>
+
+    <p>核心趋势：<strong>单卡再难有 2× 跳跃，整柜带宽与 cluster 调度是新战场</strong>。</p>
+
+    <h3>4.7.6 AMD / Google TPU 现状（2026）</h3>
+
+    <table>
+      <tr><th>方案</th><th>对应 NVIDIA</th><th>差距</th><th>优势</th></tr>
+      <tr><td>AMD MI325X (CDNA 3.5)</td><td>~H200</td><td>fp8 算力略低</td><td>256 GB HBM3e — 显存王</td></tr>
+      <tr><td>AMD MI350 (CDNA 4, 2025)</td><td>~B200</td><td>fp4 支持</td><td>开源 ROCm 生态长期投资</td></tr>
+      <tr><td>Google TPU v6 Trillium</td><td>~H200 (BF16)</td><td>fp4 弱</td><td>整 pod 训练效率高</td></tr>
+      <tr><td>Google TPU v7 (2025-26)</td><td>~B200</td><td>仅 GCP</td><td>Gemini 系列自用</td></tr>
+      <tr><td>Cerebras WSE-3</td><td>晶圆级单卡</td><td>不同范式</td><td>900K core, 训练大模型快</td></tr>
+      <tr><td>Groq LPU</td><td>专攻推理</td><td>训练弱</td><td>700+ tokens/s/user — 最快推理</td></tr>
+      <tr><td>SambaNova SN40L</td><td>专攻 MoE 推理</td><td>—</td><td>大 SRAM, 适合 1T+ MoE</td></tr>
+    </table>
+
+    <p><strong>2026 工业现实</strong>：训练市场 NVIDIA 仍 90%+ 占有，推理市场被 Groq / Cerebras / TPU / AMD 切走 20-30%。但 CUDA 仍是<strong>研发 + 算法创新的起点</strong>——任何新算法都先在 NVIDIA 上验证。</p>
+
+    <h2>4.8 自检</h2>
+    <details><summary>Q1: 一个 SM 同时能跑多少 thread？多少 warp？</summary><p>A100 上 2048 thread = 64 warp（同时驻留）；同时<strong>执行</strong>的只有 4 个 warp（因为有 4 个 processing block，每周期挑 4 个 warp 发射）。</p></details>
+    <details><summary>Q2: 我的 block 用了 32 thread，能跑满 GPU 吗？</summary><p>不能。32 thread = 1 warp，但 SM 想要 8-16 个 warp 才能隐藏延迟。block 太小 → 单 SM 上 warp 太少 → occupancy 上不去。</p></details>
+    <details><summary>Q3: FP32 算力高还是 FP16 算力高？差多少？</summary><p>A100：FP32 19.5 TFLOPS（用 CUDA core），FP16+TC 312 TFLOPS（用 Tensor Core）。差 16 倍。所以 LLM 推理用 fp16/bf16/fp8。</p></details>
+    <details><summary>Q4: cooperative_groups 是什么？</summary><p>CUDA 9+ 引入的"任意粒度同步"API。可以细到 warp 内 8 thread 同步、粗到 grid 内所有 block 同步（grid sync 需要 sm_60+ 且专用 launch API）。第 7 章会用到 warp-level reduce。</p></details>
+    <details><summary>Q5: 寄存器溢出 (register spill) 是什么？</summary><p>当编译器发现一个 thread 用的寄存器超过硬件上限（A100 上 thread 最多 255 寄存器），多出的 "本地变量" 会被放到 <strong>local memory</strong>——其实是 global memory 的私有分区，奇慢。Nsight 报告里看 "Stack Spills" 行。</p></details>
+
+    <h2>4.9 练习</h2>
+    <ol>
+      <li>跑 <code>warp_divergence.cu</code>，改 <code>iters</code> 看耗时如何线性变化。</li>
+      <li>给 <code>occupancy_probe.cu</code> 加一个 <code>shared_kernel</code>，用 <code>__shared__ float buf[16384]</code>（= 64 KB），看 SM 上能驻留几个 block。</li>
+      <li>查阅你 GPU 的 <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities">Compute Capability 表</a>，记下：每 SM 最大寄存器、shared mem、warp 数。</li>
+    </ol>
+
+    <h2>下一步</h2>
+    <p>第 5 章是性能优化的真正起点：<strong>内存层级与合并访问</strong>。理解了内存才能理解为什么写 kernel 95% 的力气花在"减少访存"上。</p>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch03-threads/index.html"><span class="label">上一章</span>← 03 · 线程模型</a>
+      <a class="next" href="../ch05-memory/index.html"><span class="label">下一章</span>05 · 内存层级 →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body></html>

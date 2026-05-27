@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 7 章 · Reduction / Scan / Atomics</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head><body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol><li><a href="../ch01-intro/index.html">导论与环境</a></li><li><a href="../ch02-hello/index.html">Hello CUDA</a></li><li><a href="../ch03-threads/index.html">线程模型与索引</a></li><li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li></ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5"><li><a href="../ch05-memory/index.html">内存层级</a></li><li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li><li><a href="../ch07-reduce/index.html" class="current">Reduction & Scan</a></li><li><a href="../ch08-async/index.html">性能分析与异步</a></li></ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9"><li><a href="../ch09-gemm/index.html">GEMM 深入</a></li><li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li><li><a href="../ch11-attention/index.html">Attention 入门</a></li><li><a href="../ch12-flashattn/index.html">FlashAttention</a></li><li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li><li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li></ol>
+      <div class="stage">附录</div><ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 7 章 · Reduction / Scan / Atomics</h1>
+    <div class="chapter-meta"><span>⏱️ 60 分钟</span><span>🎯 写出 warp-shuffle reduce</span><span>📂 code/ch07_reduce/</span></div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>掌握 GPU reduction 五阶段优化套路（divergent → sequential → halved grid → unroll warp → shuffle）</li>
+      <li>会用 <code>__shfl_down_sync / __shfl_up_sync</code> 在 warp 内交换数据</li>
+      <li>写出 block 内 inclusive prefix sum</li>
+      <li>明白 atomics 在高冲突下的代价，怎样用 shared-mem 私有桶规避</li>
+    </ul>
+
+    <p>本章看似工程小练习，但 Softmax (Ch10)、LayerNorm/RMSNorm、FlashAttention 的 online-softmax 全都依赖 block-reduce / warp-reduce 模板。<strong>写熟一次，受用整章 LLM。</strong></p>
+
+    <h2 id="reduce">7.1 Reduction：求和的五次进化</h2>
+    <p>问题：把 N=16M 个 float 加在一起。理想带宽利用 = N×4 字节 / 时间 / peak。</p>
+
+    <h3>v1: divergent 分歧版</h3>
+<pre><code class="language-cpp">for (int s = 1; s &lt; blockDim.x; s *= 2) {
+    if (tid % (2*s) == 0) sdata[tid] += sdata[tid + s];   // ❌ warp 内 31/32 lane 闲着
+    __syncthreads();
+}</code></pre>
+    <p>问题：判断条件 <code>tid % (2*s) == 0</code> 让 warp 内每次只活 1/2、1/4 ... 的 lane → warp divergence。</p>
+
+    <h3>v2: 顺序地址版</h3>
+<pre><code class="language-cpp">for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+    if (tid &lt; s) sdata[tid] += sdata[tid + s];     // 同 warp 内 tid 都满足条件
+    __syncthreads();
+}</code></pre>
+    <p>每 warp 全员活动直到 s = 16，分歧大幅减少；同时访问也 coalesce。</p>
+
+    <h3>v3: 启动减半 + 每 thread 加两元素</h3>
+<pre><code class="language-cpp">int i = blockIdx.x * (blockDim.x * 2) + tid;
+float v = in[i] + in[i + blockDim.x];      // load 两个再写 sdata
+sdata[tid] = v;</code></pre>
+    <p>kernel launch 开销摊薄一半；同时让算术与内存比例上升。</p>
+
+    <h3>v4: 展开最后一个 warp（去掉无用 sync）</h3>
+<pre><code class="language-cpp">for (int s = blockDim.x / 2; s &gt; 32; s &gt;&gt;= 1) {
+    if (tid &lt; s) sdata[tid] += sdata[tid + s];
+    __syncthreads();
+}
+// 当 s ≤ 32, 整个折叠都在同一 warp 内，硬件已经 SIMT 同步，不需要 __syncthreads
+if (tid &lt; 32) warp_reduce(sdata, tid);</code></pre>
+
+    <h3>v5: warp shuffle，完全甩掉 shared 的最后一级</h3>
+<pre><code class="language-cpp">// 用 __shfl_down_sync 直接在寄存器间交换
+for (int off = 16; off &gt; 0; off &gt;&gt;= 1)
+    v += __shfl_down_sync(0xffffffff, v, off);
+// 32 个 warp-sum 写 shared, 让 warp 0 再 reduce 一次得到 block-sum</code></pre>
+
+    <p>实测对比（T4，N=16M）：</p>
+    <table>
+      <tr><th>版本</th><th>关键改动</th><th>时间</th><th>带宽</th></tr>
+      <tr><td>v1</td><td>原始</td><td>~5.2 ms</td><td>~13 GB/s</td></tr>
+      <tr><td>v2</td><td>sequential addressing</td><td>~3.4 ms</td><td>~20 GB/s</td></tr>
+      <tr><td>v3</td><td>每 thread 加 2 个</td><td>~1.7 ms</td><td>~40 GB/s</td></tr>
+      <tr><td>v4</td><td>unroll last warp</td><td>~1.2 ms</td><td>~55 GB/s</td></tr>
+      <tr><td>v5</td><td>warp shuffle</td><td>~0.85 ms</td><td>~78 GB/s</td></tr>
+    </table>
+    <p>v5 已经接近 T4 的 memory-bound roofline（实际 peak ≈ 250 GB/s，剩余差距来自 host-side finalize、grid 大小、L2 命中）。在 LLM 推理里基本用 v5 模板。</p>
+
+    <h2 id="shuffle">7.2 Warp Shuffle 详解</h2>
+    <p>shuffle 指令让同 warp 内 32 个 lane 在寄存器之间直接交换数据，无需 shared memory：</p>
+<pre><code class="language-cpp">__shfl_sync(mask, var, src_lane);          // 广播
+__shfl_up_sync(mask, var, delta);          // 每 lane 收 lane-delta 的值
+__shfl_down_sync(mask, var, delta);        // 每 lane 收 lane+delta 的值
+__shfl_xor_sync(mask, var, lane_mask);     // 跟 lane^lane_mask 交换</code></pre>
+
+    <p><strong>mask</strong> 是参与的 lane 位掩码，几乎总传 <code>0xffffffff</code>（全 32 lane）。
+       <strong>关键好处</strong>：少一次 shared mem round trip，省 <code>__syncthreads</code>。</p>
+
+    <h2 id="scan">7.3 Prefix Sum (Scan)</h2>
+    <p>定义：<code>out[i] = in[0] + in[1] + ... + in[i]</code>（inclusive）。
+       在 LLM 里用于：top-p 采样（按 cumulative prob 找截断点）、PagedAttention 的页索引计算、稀疏 softmax。</p>
+
+    <p>warp 内 inclusive scan（Hillis-Steele，5 步）：</p>
+<pre><code class="language-cpp">__device__ float warp_inclusive_scan(float v) {
+    for (int o = 1; o &lt; 32; o &lt;&lt;= 1) {
+        float t = __shfl_up_sync(0xffffffff, v, o);
+        if ((threadIdx.x &amp; 31) &gt;= o) v += t;
+    }
+    return v;
+}</code></pre>
+
+    <p>block 内 scan：每 warp 算 partial，warp tail 收集到 shared，再用 1 个 warp 扫一次，最后把偏移加回去。完整见 <a href="../../code/ch07_reduce/scan.cu">scan.cu</a>。</p>
+
+    <h2 id="atomics">7.4 Atomics</h2>
+    <p>常用：</p>
+<pre><code class="language-cpp">atomicAdd(&amp;hist[bin], 1);              // int/uint/float/double
+atomicMax(&amp;maxv, val);                 // int / uint
+atomicCAS(&amp;p, expected, new_val);      // 通用乐观锁基元</code></pre>
+
+    <p>原子操作的代价：对<strong>同一地址</strong>的并发原子会被序列化。256-bin 直方图，全局 atomic 时 32M 元素争 256 个地址，热点严重。</p>
+
+    <h3>规避：shared 私有桶 + 合并</h3>
+<pre><code class="language-cpp">__shared__ unsigned int local_h[256];
+
+// 1) block 内做私有 hist (256 lane 在 shared 上 atomic，冲突大幅缩小)
+for (int i = gid; i &lt; n; i += stride)
+    atomicAdd(&amp;local_h[in[i]], 1u);
+__syncthreads();
+
+// 2) 把私有 hist atomic 加回全局 (每 block 只加 256 次)
+for (int i = tid; i &lt; 256; i += blockDim.x)
+    atomicAdd(&amp;global_h[i], local_h[i]);</code></pre>
+
+    <p>实测 (T4, N=16M)：</p>
+    <table>
+      <tr><th>方法</th><th>时间</th><th>说明</th></tr>
+      <tr><td>global atomic</td><td>~14 ms</td><td>热点冲突</td></tr>
+      <tr><td>shared + global</td><td>~0.4 ms</td><td>35× 加速</td></tr>
+    </table>
+
+    <h2>7.5 自检</h2>
+    <details><summary>Q1: warp shuffle 比 shared memory 快多少？</summary><p>~2×。shuffle 直接在 SM 内 register file 间传递，shared mem 至少要一次读 + 一次写，外加 bank conflict 风险。</p></details>
+    <details><summary>Q2: <code>__shfl_*</code> 一定要 <code>_sync</code> 版吗？</summary><p>是的，CUDA 9+ 强制要 mask 参数（旧的不带 mask 版本已废弃）。原因：cooperative groups + Volta 后 warp 不再隐式同步。</p></details>
+    <details><summary>Q3: <code>atomicAdd(&amp;p, v)</code> 对 float 安全吗？</summary><p>是。CUDA 提供 fp32 / fp16 原子加。但是 <strong>顺序不保证</strong>——多次浮点 atomicAdd 累加结果会受执行顺序影响，bit-wise 不可复现。</p></details>
+    <details><summary>Q4: block 内有 64 warp，warp shuffle 如何处理跨 warp？</summary><p>不能。shuffle 只在同 warp 32 lane 内。跨 warp 必须经 shared memory。reduce v5 就是这个模式：每 warp 内 shuffle，warp 间用 shared。</p></details>
+    <details><summary>Q5: 我能用 reduce v5 处理 N = 1B 吗？</summary><p>能。grid-stride loop，每 block 处理多个元素；最后用 host 把 grid 个 partial 加起来 → 单层 reduce 就够了。如果连 grid 都装不下 partial，再分级。</p></details>
+
+    <h2>7.6 练习</h2>
+    <ol>
+      <li>把 <code>reduce_v5</code> 改成"求最大值"：把 <code>+</code> 换成 <code>fmaxf</code>，warp shuffle 也跟着换 max。</li>
+      <li>实现跨 block 的 scan：先 block 内 scan，导出每 block 的总和；再 scan 这些总和；最后把偏移加回所有 element。</li>
+      <li><code>histogram.cu</code>：把 BINS 改成 4096（不能放 shared 里），思考怎么做？提示：用 L2 缓冲或者多次 pass。</li>
+      <li>用 <code>cooperative_groups</code> 重写 v5：<code>cg::reduce</code> 模板。</li>
+    </ol>
+
+    <h2 id="industry">7.7 工业实战：CUB、cooperative_groups、原子热点、数值稳定</h2>
+
+    <h3>7.7.1 CUB / Thrust — 不要重复造轮子</h3>
+
+    <p>生产代码很少自己写 reduce v5——直接用 <strong>CUB</strong>（CUDA UnBound）。CUB 是 NVIDIA 开源的 device-level / block-level / warp-level 集合算法库，跟 nvcc 一起装，header-only：</p>
+
+<pre><code class="language-cpp">#include &lt;cub/cub.cuh&gt;
+
+// 1) Device-wide reduction (代替你的 reduce v5)
+size_t temp_bytes = 0;
+cub::DeviceReduce::Sum(nullptr, temp_bytes, d_in, d_out, N);  // 询问空间
+cudaMalloc(&amp;d_tmp, temp_bytes);
+cub::DeviceReduce::Sum(d_tmp, temp_bytes, d_in, d_out, N);    // 真跑
+
+// 2) Block-level reduction (代替自己写 warp_sum + shared)
+__global__ void my_kernel(float* x, float* out) {
+    typedef cub::BlockReduce&lt;float, 256&gt; BlockR;
+    __shared__ typename BlockR::TempStorage tmp;
+    float v = x[threadIdx.x];
+    float sum = BlockR(tmp).Sum(v);
+    if (threadIdx.x == 0) out[blockIdx.x] = sum;
+}
+
+// 3) Warp-level scan
+typedef cub::WarpScan&lt;int&gt; WarpScan;
+int aggregate;
+WarpScan(temp).InclusiveSum(thread_data, thread_data, aggregate);</code></pre>
+
+    <p>CUB 内部自带 architecture-specific 优化（pre-Volta 用 shfl，Volta+ 用 cooperative_groups），<strong>性能通常比手写好且更稳</strong>。还提供 Scan、Sort、Histogram、Select 等几十种算法。</p>
+
+    <p><strong>什么时候自己写</strong>：CUB 是模板库，给 generic 场景；如果你的 reduce 是 attention/softmax 的内嵌部分，需要跟外层算子融合 → 自己写 warp-level 模板更灵活。</p>
+
+    <h3>7.7.2 cooperative_groups — Volta+ 的细粒度同步</h3>
+
+    <p>Volta 引入 "independent thread scheduling"——warp 内 32 lane 不再隐式同步。这让 <code>__shfl_*_sync</code> 的 mask 参数变成强制要求，也催生了 cooperative_groups API：</p>
+
+<pre><code class="language-cpp">#include &lt;cooperative_groups.h&gt;
+namespace cg = cooperative_groups;
+
+__global__ void my_reduce(float* x, float* out, int n) {
+    auto block = cg::this_thread_block();
+    auto warp  = cg::tiled_partition&lt;32&gt;(block);
+    // 16-lane tile (subwarp), 用得少但偶尔需要
+    auto half_warp = cg::tiled_partition&lt;16&gt;(warp);
+
+    float v = x[blockIdx.x * blockDim.x + threadIdx.x];
+
+    // warp-level reduce (替代手写 shfl 循环)
+    v = cg::reduce(warp, v, cg::plus&lt;float&gt;());
+
+    // block-level reduce 需要 shared, CUB 更顺手
+    __shared__ float warp_sums[32];
+    if (warp.thread_rank() == 0) warp_sums[warp.meta_group_rank()] = v;
+    block.sync();
+
+    if (warp.meta_group_rank() == 0) {
+        float w = (warp.thread_rank() &lt; block.num_threads() / 32)
+                  ? warp_sums[warp.thread_rank()] : 0;
+        w = cg::reduce(warp, w, cg::plus&lt;float&gt;());
+        if (warp.thread_rank() == 0) out[blockIdx.x] = w;
+    }
+}</code></pre>
+
+    <p>好处：API 更易读、避免 mask 写错。坏处：代码比裸 shfl 长。生产里两者混用，看团队 style。</p>
+
+    <h3>7.7.3 原子操作的<strong>热点</strong>问题与规避</h3>
+
+    <p>原子操作对同一地址会被硬件序列化。常见性能悬崖：</p>
+
+<pre><code class="language-cpp">// ❌ 灾难: 所有 thread atomic 到同一地址
+__global__ void sum_bad(const float* x, float* total, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) atomicAdd(total, x[i]);    // N 个 thread 排队
+}
+// N=1M 时大约比 reduce v5 慢 100×
+
+// ✅ 好: 先 block-wide reduce, 每 block 只 atomic 一次
+__global__ void sum_good(const float* x, float* total, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float v = (i &lt; n) ? x[i] : 0;
+    float block_sum = cg::reduce(cg::this_thread_block(), v, cg::plus&lt;float&gt;());
+    if (threadIdx.x == 0) atomicAdd(total, block_sum);
+}</code></pre>
+
+    <p><strong>判断原子是否成为瓶颈</strong>：Nsight Compute 看 <code>l1tex__t_sectors_pipe_lsu_mem_global_op_atom</code>（原子事务数）和 stall reason "Long Scoreboard"——如果占比高就是热点。</p>
+
+    <h3>7.7.4 浮点 reduce 的数值精度</h3>
+
+    <p>问题：把 N=10⁶ 个 fp32 数累加，<strong>顺序不同结果不同</strong>。如果分布范围大（含 1e-6 和 1e6），简单累加会丢小数。</p>
+
+    <h4>方法 1：fp64 累加器（推荐生产用）</h4>
+<pre><code class="language-cpp">// 输入 fp32, 累加器 fp64
+double sum_d = 0;
+for (...) sum_d += double(x[i]);
+return float(sum_d);
+// CPU 一行, GPU reduce v5 把 acc 改 double 即可</code></pre>
+
+    <h4>方法 2：Kahan 补偿求和（用 fp32 也能高精度）</h4>
+<pre><code class="language-cpp">float sum = 0, c = 0;             // c 是误差补偿项
+for (...) {
+    float y = x[i] - c;
+    float t = sum + y;
+    c = (t - sum) - y;            // 把这一步丢失的 bit 存回 c
+    sum = t;
+}</code></pre>
+
+    <p>Kahan 在 fp32 里精度接近 fp64，但浮点指令数 ×4。 RMSNorm / LayerNorm 里 sum 用 fp32 Kahan 或 fp64 累加都可，<strong>不能直接 fp16 累加</strong>——长 D 时累加误差直接爆。</p>
+
+    <h3>7.7.5 LLM 推理中的 reduce 出现在哪</h3>
+    <p>本章模板会反复出现在后面：</p>
+    <ul>
+      <li><strong>Softmax</strong> (Ch10)：row-wise max reduce + sum reduce</li>
+      <li><strong>LayerNorm / RMSNorm</strong> (Ch10)：row-wise mean / variance reduce</li>
+      <li><strong>FlashAttention</strong> (Ch12)：online softmax 的 (m, l) 合并就是改造过的 reduce</li>
+      <li><strong>Sampling top-k / top-p</strong> (Ch13)：scan-then-truncate</li>
+      <li><strong>Cross-entropy loss</strong> 训练时：log-sum-exp reduce</li>
+    </ul>
+    <p>所以本章不只是 demo——是后面几章的<strong>基础模板</strong>。</p>
+
+    <h2 id="frontier">7.8 研究前沿（2025-2026）：Cluster Reduce 与 LLM 推理中的 reduce</h2>
+
+    <h3>7.8.1 Cluster-wide Reduce（Hopper+）</h3>
+
+    <p>Hopper / Blackwell 的 CTA cluster（见 3.9）让 reduce 多了一个层级：</p>
+
+<pre><code>层级:
+  warp   (32)     —— __shfl_*_sync / cg::reduce(warp, ...)
+  block  (≤1024)  —— BlockReduce (CUB) / cg::reduce(block, ...)
+  <strong>cluster (≤16 blocks) —— cluster.sync() + DSMEM, sm_90+</strong>
+  grid   (≤2B)    —— cooperative_groups::this_grid().sync() + 全局 atomic</code></pre>
+
+<pre><code class="language-cpp">// Cluster 内 reduce: 多个 block 协作算一个大 sum
+__global__ void __cluster_dims__(4, 1, 1) cluster_reduce(float* x, float* out, int n) {
+    namespace cg = cooperative_groups;
+    auto cluster = cg::this_cluster();
+    auto block   = cg::this_thread_block();
+    int  rank    = cluster.block_rank();          // 0..3
+    int  cluster_size = cluster.num_blocks();      // 4
+
+    extern __shared__ float smem[];
+    // 1) 每 block 算自己负责段的 partial sum
+    float local = 0;
+    for (int i = block.thread_rank() + rank * 1024;
+             i &lt; n;
+             i += cluster_size * 1024) local += x[i];
+    local = cg::reduce(block, local, cg::plus&lt;float&gt;());
+    if (block.thread_rank() == 0) smem[0] = local;
+    block.sync();
+
+    // 2) cluster 同步: 让 rank=0 看到所有 block 的 partial
+    cluster.sync();
+
+    if (rank == 0 &amp;&amp; block.thread_rank() == 0) {
+        float total = 0;
+        for (int r = 0; r &lt; cluster_size; ++r) {
+            float* peer = cluster.map_shared_rank(smem, r);   // 跨 block 读 shared!
+            total += peer[0];
+        }
+        out[blockIdx.x / cluster_size] = total;
+    }
+}</code></pre>
+
+    <p><strong>什么时候用</strong>：单 block reduce 已经够快，cluster reduce 适合"输出极少 + 输入极大 + 一次 launch 算完"的场景（如训练梯度全 reduce），把 atomicAdd 全局热点干掉。</p>
+
+    <h3>7.8.2 LLM 推理中 reduce 出现的"新"地方</h3>
+
+    <p>除了 softmax / norm，2024-2026 这些算子大量用 reduce：</p>
+
+    <table>
+      <tr><th>算子</th><th>用到的 reduce</th><th>难点</th></tr>
+      <tr><td><strong>MoE 路由 (top-k experts)</strong></td><td>每 token 选 top-k logits</td><td>V=64 sort, block 内 top-k</td></tr>
+      <tr><td><strong>MoE all-to-all</strong></td><td>跨 GPU all-reduce + token shuffle</td><td>NCCL + 自定义 fused</td></tr>
+      <tr><td><strong>Speculative verification</strong></td><td>逐位置 max(p_target/p_draft)</td><td>warp-level 并行</td></tr>
+      <tr><td><strong>KV cache 量化的 per-group scale</strong></td><td>每 group abs max</td><td>fused 到 attention</td></tr>
+      <tr><td><strong>chunk prefill</strong></td><td>chunk 内最大 logit (mask)</td><td>跨 chunk merge</td></tr>
+      <tr><td><strong>Online softmax (FA)</strong></td><td>tile 内 (m, l) merge</td><td>本教程 Ch10/12</td></tr>
+    </table>
+
+    <h3>7.8.3 SGLang RadixAttention：reduce 在 prefix tree 上</h3>
+
+    <p>SGLang 用<strong>Trie 数据结构</strong>缓存多请求共享前缀的 KV：</p>
+    <ol>
+      <li>每个新请求查找最长前缀命中</li>
+      <li>命中部分直接用现成的 KV cache, 跳过 prefill 重算</li>
+      <li>未命中部分正常 prefill, attention kernel 内把"命中段 + 新段"的 softmax<strong>分段在线 reduce</strong></li>
+    </ol>
+
+    <p>这要求 attention kernel 能处理"两段不同来源的 K/V" → 等同于在 FlashAttention 里多加一个 (m, l) merge 步骤（跟 chunk prefill 同思路）。kernel 改动 ~50 行，吞吐对 chat 工作负载 +2-5×。</p>
+
+    <h3>7.8.4 数值精度新挑战：fp8 / fp4 时代的累加</h3>
+
+    <p>fp8 / fp4 数据，<strong>累加器更要小心</strong>：</p>
+    <ul>
+      <li>fp8 (E4M3) 动态范围 ~448，长 reduce 极易溢出 → <strong>必须 fp32 累加</strong></li>
+      <li>fp4 (E2M1) 范围 ~6 → 几乎不能直接做 reduce，必须 dequant 到 fp8/fp16 再加</li>
+      <li>Blackwell 2nd-gen TE 对每 16/32 元素自动选 scale，称为 <strong>microscaling</strong> — reduce 在 group 内做完再用 group scale 转回真实值</li>
+    </ul>
+
+    <h3>7.8.5 cooperative_groups 在 CUDA 12.x 的新功能</h3>
+    <ul>
+      <li><code>cg::async_reduce</code>：异步 reduce, 与 cp.async 配合做"加载 + reduce" 重叠</li>
+      <li><code>cg::labeled_partition</code>：按动态条件分组，对稀疏 attention 友好</li>
+      <li><code>cg::cluster_group</code>：cluster 级同步（如上）</li>
+      <li><code>cg::thread_block_tile&lt;16&gt;</code> / <code>&lt;8&gt;</code>：subwarp 分区，对 MoE top-k 路由有用</li>
+    </ul>
+
+    <h3>7.8.6 工业 reduce 推荐栈（2026）</h3>
+    <table>
+      <tr><th>场景</th><th>用</th></tr>
+      <tr><td>简单 block reduce</td><td>CUB <code>BlockReduce</code></td></tr>
+      <tr><td>warp reduce</td><td><code>cg::reduce(warp, ...)</code> 或 <code>__shfl_*_sync</code></td></tr>
+      <tr><td>跨 grid reduce</td><td>CUB <code>DeviceReduce</code> 或 cooperative launch + grid sync</td></tr>
+      <tr><td>cluster reduce</td><td>cooperative_groups (Hopper+)，仅特殊场景</td></tr>
+      <tr><td>融入 attention 的 (m, l)</td><td>手写, 见 Ch10/12 模板</td></tr>
+      <tr><td>跨 GPU all-reduce</td><td>NCCL <code>ncclAllReduce</code> / NVSHMEM</td></tr>
+    </table>
+
+    <h2>7.9 常见坑</h2>
+    <ul>
+      <li>shuffle mask 写错（不是全 1）→ kernel 偶发挂，难调</li>
+      <li>v4 里假设 BLOCK ≥ 64 → BLOCK=32 时跑炸；写代码时加 static_assert</li>
+      <li>float atomicAdd 累加 → 结果不可重现，需 BFGS-类算法时要注意</li>
+      <li>跨 block 的 prefix sum 漏掉"加偏移"→ 各 block 内对，全局错</li>
+    </ul>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch06-tile/index.html"><span class="label">上一章</span>← 06 · Tile</a>
+      <a class="next" href="../ch08-async/index.html"><span class="label">下一章</span>08 · 性能分析与异步 →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body></html>

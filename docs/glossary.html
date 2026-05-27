@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>术语表 · CUDA × LLM 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">导航</div>
+      <ol style="counter-reset: ch -1">
+        <li style="list-style:none"><a href="index.html">🏠 首页</a></li>
+        <li style="list-style:none"><a href="glossary.html" class="current">📖 术语表</a></li>
+      </ol>
+    </nav>
+  </aside>
+  <main>
+    <h1>📖 术语表 (Glossary)</h1>
+    <p>按章节顺序整理；首次出现于第几章在最后列出。</p>
+
+    <h2>GPU 硬件</h2>
+    <table>
+      <tr><th>中文</th><th>英文</th><th>含义</th><th>首现</th></tr>
+      <tr><td>流式多处理器</td><td>Streaming Multiprocessor (SM)</td><td>GPU 上独立调度执行的硬件单元，每个 SM 内含若干 CUDA core / Tensor Core / 共享内存。A100 有 108 个 SM。</td><td>Ch4</td></tr>
+      <tr><td>线程束</td><td>warp</td><td>32 个 thread 一组，作为 SM 的最小调度单位，同一 warp 在同一时钟周期执行同一条指令。</td><td>Ch3</td></tr>
+      <tr><td>单指令多线程</td><td>SIMT</td><td>Single Instruction, Multiple Threads — warp 内 32 个线程同步执行同一指令但操作不同数据。</td><td>Ch4</td></tr>
+      <tr><td>线程束分歧</td><td>warp divergence</td><td>同一 warp 内不同线程走了 if/else 两个分支，会被串行执行，性能下降。</td><td>Ch4</td></tr>
+      <tr><td>占用率</td><td>occupancy</td><td>实际活跃 warp 数 / SM 最大支持 warp 数。高 occupancy 利于隐藏内存延迟。</td><td>Ch4</td></tr>
+      <tr><td>张量核心</td><td>Tensor Core</td><td>专门做矩阵乘累加 (MMA) 的硬件单元，从 Volta 开始引入，吞吐远高于 CUDA core。</td><td>Ch9</td></tr>
+    </table>
+
+    <h2>编程模型</h2>
+    <table>
+      <tr><th>中文</th><th>英文</th><th>含义</th><th>首现</th></tr>
+      <tr><td>核函数</td><td>kernel</td><td>用 <code>__global__</code> 修饰的函数，由 host 调用、在 device 上由大量线程并行执行。</td><td>Ch2</td></tr>
+      <tr><td>网格</td><td>grid</td><td>kernel 启动时的所有线程块的集合。</td><td>Ch3</td></tr>
+      <tr><td>线程块</td><td>block / CTA</td><td>共享 shared memory 的一组 thread，最大 1024，分配到同一 SM。</td><td>Ch3</td></tr>
+      <tr><td>合作组</td><td>cooperative groups</td><td>CUDA 9+ 提供的灵活同步原语，可以细粒度同步 warp 内/block 内/grid 内线程。</td><td>Ch7</td></tr>
+      <tr><td>流</td><td>stream</td><td>异步命令队列，同一 stream 内严格顺序，不同 stream 间并行。</td><td>Ch8</td></tr>
+    </table>
+
+    <h2>内存</h2>
+    <table>
+      <tr><th>中文</th><th>英文</th><th>含义</th><th>首现</th></tr>
+      <tr><td>全局内存</td><td>global memory</td><td>GPU 显存，所有线程可访问，延迟最高（几百周期），容量最大。</td><td>Ch5</td></tr>
+      <tr><td>共享内存</td><td>shared memory</td><td>SM 上的片上 SRAM，block 内所有线程共享，延迟接近 L1。</td><td>Ch5</td></tr>
+      <tr><td>寄存器</td><td>register</td><td>线程私有的最快存储，每个 SM 有 64K~256K 寄存器。</td><td>Ch5</td></tr>
+      <tr><td>合并访问</td><td>memory coalescing</td><td>一个 warp 的 32 个线程访问连续 128B 内存，硬件合并为一次内存事务。</td><td>Ch5</td></tr>
+      <tr><td>存储体冲突</td><td>bank conflict</td><td>同一 warp 多线程访问 shared memory 的同一 bank，会被串行化。</td><td>Ch6</td></tr>
+    </table>
+
+    <h2>LLM 推理</h2>
+    <table>
+      <tr><th>中文</th><th>英文</th><th>含义</th><th>首现</th></tr>
+      <tr><td>通用矩阵乘</td><td>GEMM</td><td>General Matrix Multiplication, C = αAB + βC，LLM 80% 的计算来自 GEMM。</td><td>Ch9</td></tr>
+      <tr><td>缩放点积注意力</td><td>Scaled Dot-Product Attention</td><td>Attention(Q,K,V) = softmax(QKᵀ/√d) V，Transformer 核心算子。</td><td>Ch11</td></tr>
+      <tr><td>在线 softmax</td><td>online softmax</td><td>分块计算 softmax 时维护当前最大值与归一化项的算法，是 FlashAttention 的基石。</td><td>Ch10</td></tr>
+      <tr><td>键值缓存</td><td>KV Cache</td><td>推理时缓存历史 token 的 K/V 投影，避免每步重算。</td><td>Ch13</td></tr>
+      <tr><td>旋转位置编码</td><td>Rotary Position Embedding (RoPE)</td><td>用复数旋转方式注入位置信息，被 Llama 等主流模型采用。</td><td>Ch13</td></tr>
+      <tr><td>分页注意力</td><td>PagedAttention</td><td>vLLM 提出的 KV cache 分页管理，让显存利用率接近 OS 分页。</td><td>Ch14</td></tr>
+    </table>
+
+    <h2>工具链</h2>
+    <table>
+      <tr><th>中文</th><th>英文</th><th>含义</th><th>首现</th></tr>
+      <tr><td>编译器</td><td>nvcc</td><td>NVIDIA CUDA 编译器，把 .cu 编译为 host C++ + device PTX/SASS。</td><td>Ch1</td></tr>
+      <tr><td>中间表示</td><td>PTX</td><td>Parallel Thread eXecution，CUDA 的虚拟 ISA，类似 LLVM IR。</td><td>Ch8</td></tr>
+      <tr><td>架构机器码</td><td>SASS</td><td>实际硬件执行的机器码，与 SM 架构强绑定。</td><td>Ch8</td></tr>
+      <tr><td>性能分析器</td><td>Nsight Compute</td><td>NVIDIA 的 kernel 级性能分析工具，输出 roofline、stall reason 等。</td><td>Ch8</td></tr>
+      <tr><td>时间线分析器</td><td>Nsight Systems</td><td>系统级 timeline 分析，看 H2D/D2H/kernel/stream overlap。</td><td>Ch8</td></tr>
+    </table>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="index.html"><span class="label">返回</span>🏠 首页</a>
+      <a class="next" href="ch01-intro/index.html"><span class="label">开始学习</span>第 1 章 →</a>
+    </nav>
+  </main>
+</div>
+<script src="assets/tutorial.js"></script>
+</body>
+</html>

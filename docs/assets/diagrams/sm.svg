@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 360" font-family="-apple-system, sans-serif">
+  <style>
+    .lbl { fill:#1f2328; font-size:12px; }
+    .ttl { fill:#0550ae; font-size:14px; font-weight:600; }
+    .sub { fill:#6b7280; font-size:11px; }
+    .box { fill:#ffffff; stroke:#d0d7de; stroke-width:1; }
+    .core { fill:#f6f8fa; stroke:#1a7f37; stroke-width:1; }
+    .tc   { fill:#fff8c5; stroke:#bf8700; stroke-width:1.5; }
+    .mem  { fill:#ddf4ff; stroke:#0969da; stroke-width:1.5; }
+  </style>
+
+  <rect x="10" y="10" width="700" height="340" class="box" rx="8"/>
+  <text x="20" y="32" class="ttl">Streaming Multiprocessor (SM) — 以 Ampere SM80 为例</text>
+
+  <!-- 4 processing blocks -->
+  <g>
+    <rect x="20" y="50" width="160" height="170" class="box" rx="6"/>
+    <text x="30" y="68" class="ttl">Processing Block 0</text>
+    <text x="30" y="86" class="sub">warp scheduler + dispatch</text>
+    <!-- 16 fp32 cores in 4x4 -->
+    <g fill="#21262d">
+      <text x="30" y="106" class="lbl">16 × FP32 CUDA core</text>
+      <g>
+        <rect x="30" y="112" width="20" height="14" class="core"/><rect x="54" y="112" width="20" height="14" class="core"/><rect x="78" y="112" width="20" height="14" class="core"/><rect x="102" y="112" width="20" height="14" class="core"/>
+        <rect x="30" y="130" width="20" height="14" class="core"/><rect x="54" y="130" width="20" height="14" class="core"/><rect x="78" y="130" width="20" height="14" class="core"/><rect x="102" y="130" width="20" height="14" class="core"/>
+        <rect x="30" y="148" width="20" height="14" class="core"/><rect x="54" y="148" width="20" height="14" class="core"/><rect x="78" y="148" width="20" height="14" class="core"/><rect x="102" y="148" width="20" height="14" class="core"/>
+        <rect x="30" y="166" width="20" height="14" class="core"/><rect x="54" y="166" width="20" height="14" class="core"/><rect x="78" y="166" width="20" height="14" class="core"/><rect x="102" y="166" width="20" height="14" class="core"/>
+      </g>
+      <rect x="30" y="190" width="140" height="22" class="tc"/>
+      <text x="38" y="206" class="lbl">Tensor Core (3rd gen)</text>
+    </g>
+  </g>
+
+  <!-- repeat 3 times (only render 1 more for clarity) -->
+  <g transform="translate(180,0)">
+    <rect x="20" y="50" width="160" height="170" class="box" rx="6"/>
+    <text x="30" y="68" class="ttl">Processing Block 1</text>
+    <text x="30" y="86" class="sub">(同构 — 同一 SM 内 4 个)</text>
+    <text x="30" y="120" class="lbl">16 × FP32 core</text>
+    <text x="30" y="140" class="lbl">8 × FP64 core</text>
+    <text x="30" y="160" class="lbl">16 × INT32 core</text>
+    <rect x="30" y="190" width="140" height="22" class="tc"/>
+    <text x="38" y="206" class="lbl">Tensor Core</text>
+  </g>
+
+  <g transform="translate(360,0)">
+    <rect x="20" y="50" width="160" height="170" class="box" rx="6"/>
+    <text x="30" y="68" class="ttl">Processing Block 2</text>
+    <text x="30" y="120" class="lbl">. . .</text>
+  </g>
+  <g transform="translate(540,0)">
+    <rect x="20" y="50" width="160" height="170" class="box" rx="6"/>
+    <text x="30" y="68" class="ttl">Processing Block 3</text>
+    <text x="30" y="120" class="lbl">. . .</text>
+  </g>
+
+  <!-- shared memory + L1 -->
+  <rect x="20" y="240" width="680" height="90" class="mem" rx="6"/>
+  <text x="30" y="262" class="ttl">Shared Memory / L1 Cache  (192 KB on A100)</text>
+  <text x="30" y="282" class="sub">block 内所有 thread 共享 · 比 global memory 快 ~100×</text>
+  <text x="30" y="302" class="sub">通过 cudaFuncSetAttribute(...MaxDynamicSharedMemorySize...) 可以把更多空间划给 shared mem</text>
+
+  <text x="450" y="300" class="sub">寄存器池 64K × 32-bit (each SM)</text>
+  <text x="450" y="316" class="sub">→ thread 私有，占用率瓶颈之一</text>
+</svg>

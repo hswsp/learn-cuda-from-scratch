@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 11 章 · Attention 入门</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head><body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol><li><a href="../ch01-intro/index.html">导论与环境</a></li><li><a href="../ch02-hello/index.html">Hello CUDA</a></li><li><a href="../ch03-threads/index.html">线程模型与索引</a></li><li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li></ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5"><li><a href="../ch05-memory/index.html">内存层级</a></li><li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li><li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li><li><a href="../ch08-async/index.html">性能分析与异步</a></li></ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9"><li><a href="../ch09-gemm/index.html">GEMM 深入</a></li><li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li><li><a href="../ch11-attention/index.html" class="current">Attention 入门</a></li><li><a href="../ch12-flashattn/index.html">FlashAttention</a></li><li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li><li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li></ol>
+      <div class="stage">附录</div><ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 11 章 · Attention 入门</h1>
+    <div class="chapter-meta"><span>⏱️ 70 分钟</span><span>🎯 写出 SDPA</span><span>📂 code/ch11_attention/</span></div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>把"<strong>缩放点积注意力</strong>"翻译成代码：QKᵀ → softmax → ·V</li>
+      <li>实现 <strong>fused QKV projection</strong>（1 个 GEMM 代替 3 个）</li>
+      <li>看清朴素实现的 <strong>O(T²) HBM 物化问题</strong>——为下一章 FlashAttention 埋伏笔</li>
+      <li>会处理 causal mask</li>
+    </ul>
+
+    <h2>11.1 数学复习</h2>
+    <p>Scaled Dot-Product Attention (single head, single batch):</p>
+<pre><code>S = Q @ K^T / sqrt(D)     # (T, T)
+P = softmax_row(S + mask) # (T, T)
+O = P @ V                 # (T, D)</code></pre>
+    <ul>
+      <li>Q, K, V 形状 (T, D)，T = 序列长度，D = head_dim（GPT-2 small 是 64）</li>
+      <li>scale = 1/√D 防止 softmax 输入太大</li>
+      <li>causal mask：自回归生成时，token i 不能看到 j&gt;i 的 token，所以 S[i,j&gt;i] = -∞</li>
+    </ul>
+
+    <h2 id="fused-qkv">11.2 Fused QKV Projection</h2>
+    <p>输入 X: (T, D)。原本要做三次 GEMM：</p>
+<pre><code>Q = X @ W_q   (T, D) @ (D, D)
+K = X @ W_k
+V = X @ W_v</code></pre>
+    <p>把 <code>W_qkv = [W_q; W_k; W_v]</code> 水平拼成 (D, 3D)，一次 GEMM 出 (T, 3D) 再 split：</p>
+<pre><code class="language-cpp">// 1) 1 个 GEMM
+gemm(X, W_qkv, QKV, T, 3*D, D);
+
+// 2) split (T, 3*D) → 三个 (T, D)
+__global__ void split_qkv(...) {
+    int t = ..., d = ...;
+    q[t*D+d] = qkv[t*3*D + 0*D + d];
+    k[t*D+d] = qkv[t*3*D + 1*D + d];
+    v[t*D+d] = qkv[t*3*D + 2*D + d];
+}</code></pre>
+    <p>好处：</p>
+    <ul>
+      <li>3 个 GEMM → 1 个 → kernel launch 开销少 2/3</li>
+      <li>GPU 利用率高（单个大 GEMM 比三个中等 GEMM 容易跑满）</li>
+      <li>权重一次 H2D，cache 局部性更好</li>
+    </ul>
+
+    <div class="callout">
+      <strong>工业实践：</strong> TRT-LLM、vLLM、llama.cpp 都用 fused QKV。Llama 还做了进一步的 GQA（Grouped Query Attention）让 K/V 投影更少，下一章后会顺带提到。
+    </div>
+
+    <h2 id="naive">11.3 朴素三阶段 Attention</h2>
+    <p>源码：<a href="../../code/ch11_attention/attention_naive.cu">attention_naive.cu</a></p>
+<pre><code class="language-cpp">// Step 1: S = Q @ K^T * scale   (T, T)
+__global__ void qkt_scale(const float* Q, const float* K, float* S,
+                          int T, int D, float scale, bool causal) {
+    int i = ...,  j = ...;
+    if (causal &amp;&amp; j &gt; i) { S[i*T+j] = -1e30f; return; }
+    float s = 0;
+    for (int d = 0; d &lt; D; ++d) s += Q[i*D+d] * K[j*D+d];
+    S[i*T + j] = s * scale;
+}
+
+// Step 2: P = softmax_row(S)
+softmax_rows&lt;256&gt;&lt;&lt;&lt;T, 256&gt;&gt;&gt;(S, T, T);
+
+// Step 3: O = P @ V             (T, D)
+__global__ void pv_kernel(const float* P, const float* V, float* O, int T, int D) {
+    int i = ..., d = ...;
+    float acc = 0;
+    for (int j = 0; j &lt; T; ++j) acc += P[i*T+j] * V[j*D+d];
+    O[i*D+d] = acc;
+}</code></pre>
+
+    <h2>11.4 朴素实现的两个致命问题</h2>
+
+    <h3>问题 1：HBM 物化 T×T</h3>
+    <p>S 和 P 都是 T × T，必须先全部写到 HBM 再读。T=2048 时 S 占 16 MiB，T=8192 时 S 占 256 MiB——
+       不光<strong>慢</strong>（多 3 次全量 HBM 读写），<strong>显存还放不下长上下文</strong>。</p>
+
+    <h3>问题 2：softmax 是 memory-bound</h3>
+    <p>softmax 算每个元素 O(1) FLOP 但要扫两遍 T。kernel 间没法融合，每次都得回 HBM。</p>
+
+<pre class="mermaid">
+graph LR
+    Q["Q in HBM"] --> K1["QKᵀ kernel"]
+    K1 --> S1["S in HBM"]
+    S1 --> K2["softmax kernel"]
+    K2 --> P1["P in HBM"]
+    P1 --> K3["PV kernel"]
+    K3 --> O1["O in HBM"]
+    style S1 fill:#f6f8fa,stroke:#cf222e
+    style P1 fill:#f6f8fa,stroke:#cf222e
+</pre>
+
+    <p>两次完整的 T×T 显存读写——这就是 FlashAttention 要彻底干掉的地方。</p>
+
+    <h2>11.5 性能与瓶颈</h2>
+    <table>
+      <tr><th>T</th><th>D</th><th>S 显存</th><th>朴素 ms (T4)</th><th>FlashAttn ms (Ch12)</th></tr>
+      <tr><td>256</td><td>64</td><td>0.25 MiB</td><td>~0.4</td><td>~0.1</td></tr>
+      <tr><td>1024</td><td>64</td><td>4 MiB</td><td>~5</td><td>~0.6</td></tr>
+      <tr><td>4096</td><td>64</td><td>64 MiB</td><td>~85</td><td>~5</td></tr>
+      <tr><td>16384</td><td>128</td><td>1 GiB</td><td>OOM</td><td>~80</td></tr>
+    </table>
+    <p>长上下文场景下 FlashAttention 不是"快几倍"——是"能不能跑"的差别。</p>
+
+    <h2>11.6 自检</h2>
+    <details><summary>Q1: 为什么 attention 要除 √D？</summary><p>D 维度的 dot product 会随 D 增大变大（方差 = D）。除 √D 把 logits 方差归一到 1，避免 softmax 进饱和区梯度消失。</p></details>
+    <details><summary>Q2: causal mask 为啥用 -1e30 不用 -inf？</summary><p>fp32 里 -inf 也行，但 fp16 里 -inf - 大数 可能产生 NaN（uncovered subtraction）。-1e30 在 fp32 里 exp(-1e30) = 0 同效果，且更稳。</p></details>
+    <details><summary>Q3: multi-head 怎么处理？</summary><p>把 Q, K, V 改成 (B, H, T, D) 4D 张量。最简单的实现：每 head 一个 grid block，复用 single-head kernel。fused QKV 时 W_qkv = (D, 3*H*D)。</p></details>
+    <details><summary>Q4: GQA 是什么？</summary><p>Grouped Query Attention：多个 Q head 共享同一组 K/V head。Llama 2/3、Mistral 都用。好处：KV cache 显存减小（H_kv &lt; H_q），decode 阶段更快。</p></details>
+    <details><summary>Q5: attention 的 FLOPs 算多少？</summary><p>QKᵀ: 2·T²·D，PV: 2·T²·D，加 softmax 的少量 FLOPs。总共 ≈ 4·T²·D。所以 T 翻倍 FLOPs 翻 4 倍，T=8K 时 attention 已经超过 GEMM 部分的成本。</p></details>
+
+    <h2>11.7 练习</h2>
+    <ol>
+      <li>把 <code>attention_naive</code> 扩成 multi-head：B=1, H=4, T=128, D=64。</li>
+      <li>给 <code>fused_qkv</code> 用 Ch9 的 <code>gemm_reg_tile</code> 替换 tiled gemm，看是否更快。</li>
+      <li>测一下 T 从 64 到 4096 的耗时曲线，画出 O(T²) 增长曲线。</li>
+      <li>实现一个 attention 输出与 PyTorch 的 <code>F.scaled_dot_product_attention</code> 对比（Colab 上）。</li>
+    </ol>
+
+    <h2 id="industry">11.8 工业实战：MHA/MQA/GQA、prefill vs decode、causal mask 优化</h2>
+
+    <h3>11.8.1 MHA / MQA / GQA — KV cache 的演进</h3>
+
+    <table>
+      <tr><th>变体</th><th>Q heads</th><th>KV heads</th><th>代表模型</th><th>KV 显存</th><th>质量</th></tr>
+      <tr><td>MHA (Multi-Head Attn)</td><td>n_q</td><td>n_q (= Q heads)</td><td>GPT-2/3/4, Llama 1</td><td>最大 baseline</td><td>最好</td></tr>
+      <tr><td>MQA (Multi-Query Attn)</td><td>n_q</td><td>1 (共享)</td><td>PaLM, Falcon</td><td>1/n_q</td><td>小幅下降</td></tr>
+      <tr><td>GQA (Grouped-Query Attn)</td><td>n_q</td><td>n_kv (n_q/n_kv = group size)</td><td>Llama 2/3, Mistral, Qwen</td><td>n_kv/n_q</td><td>接近 MHA</td></tr>
+    </table>
+
+    <p>例：Llama 3 8B 用 n_q=32, n_kv=8 (GQA-4)，KV cache 立刻缩到 MHA 的 1/4。</p>
+
+    <h3>实现差异</h3>
+<pre><code class="language-cpp">// MHA: 各 head 完全独立
+attention(Q[b, h, :, :], K[b, h, :, :], V[b, h, :, :]) → O[b, h, :, :]
+
+// MQA: 所有 Q head 共享同一对 K/V
+attention(Q[b, h, :, :], K[b, 0, :, :], V[b, 0, :, :]) → O[b, h, :, :]
+
+// GQA: head 分组共享
+int g = h / group_size;
+attention(Q[b, h, :, :], K[b, g, :, :], V[b, g, :, :]) → O[b, h, :, :]</code></pre>
+
+    <p>kernel 层面只是 K/V 索引换一下，FlashAttention 默认支持三种。</p>
+
+    <h3>11.8.2 Prefill vs Decode — 两个完全不同的世界</h3>
+
+    <p>LLM 推理本质上是<strong>两个独立 phase</strong>：</p>
+
+    <table>
+      <tr><th></th><th>Prefill</th><th>Decode</th></tr>
+      <tr><td>触发</td><td>用户提交 prompt 后一次</td><td>之后每生成 1 个 token</td></tr>
+      <tr><td>序列长度</td><td>T = prompt 长度 (100-32K)</td><td>T = 1 (单 token)</td></tr>
+      <tr><td>attention shape</td><td>(T, T)</td><td>(1, T_total)</td></tr>
+      <tr><td>瓶颈</td><td>compute-bound (大 GEMM + T² attn)</td><td>memory-bound (小 GEMV + 全 KV 读)</td></tr>
+      <tr><td>Tensor Core 利用率</td><td>高 (大批量)</td><td>低 (M=1)</td></tr>
+      <tr><td>典型优化</td><td>FlashAttention v2, fused QKV</td><td>FlashAttention v2-decode, paged KV, 量化, spec decoding</td></tr>
+      <tr><td>典型耗时 (Llama-7B, A100)</td><td>~200 ms / 2K prompt</td><td>~15-25 ms / token</td></tr>
+    </table>
+
+    <h3>为什么要分两个 kernel</h3>
+    <p>同一个 attention kernel 在 T=2048 和 T=1 上的最优 tile 完全不同：</p>
+    <ul>
+      <li>Prefill 用 64×64 Q tile，T 个 K/V tile 流过</li>
+      <li>Decode 用 1×N Q tile（实际是 vector），K/V 直接从 cache 拉</li>
+    </ul>
+    <p>vLLM、TensorRT-LLM 都分别实现两个 kernel：<code>flash_attn_varlen_func</code>（prefill）和 <code>flash_attn_with_kvcache</code>（decode）。</p>
+
+    <h3>11.8.3 Causal mask 的高效实现</h3>
+
+    <p>Ch11 朴素实现把 -∞ 写到所有 j&gt;i 的位置，但 FlashAttention 里这是浪费：</p>
+
+<pre><code class="language-cpp">// ❌ 朴素：扫全 N×N, 一半位置算了又 mask 掉
+if (j &gt; i) S[i, j] = -inf;
+
+// ✅ 优化 1: 跳过完全 mask 掉的 tile (block-level skip)
+// FlashAttention 里, Q tile 在 [i_lo, i_hi), K/V tile 在 [j_lo, j_hi):
+//   - 如果 j_lo &gt; i_hi: 整个 K/V tile 都被 mask, 直接 skip 不计算
+//   - 如果 j_hi &lt;= i_lo: 完全 visible, 不用 mask
+//   - 部分重叠: 逐元素 mask
+if (j_lo &gt; i_hi) continue;             // skip 这个 K/V tile
+if (j_hi &lt;= i_lo) compute_no_mask();   // 不用 mask
+else compute_with_mask();              // 部分 mask</code></pre>
+
+    <p>对长 context (T=32K)，causal mask 让一半 tile 可以 skip → attention 实际只算 N²/2。FlashAttention v2 的 causal 实现就是这样。</p>
+
+    <h3>11.8.4 长 context 的工业方案</h3>
+
+    <p>T 从 2K 增到 128K 的发展：</p>
+    <ul>
+      <li><strong>FlashAttention</strong>: O(T²) FLOPs 不变, 但显存从 O(T²) 降到 O(T)，让 32K 可行</li>
+      <li><strong>Sliding Window Attention</strong> (Mistral 7B): 只 attend 最近 W=4K 个 token，把 attention 复杂度从 O(T²) 降到 O(T·W)</li>
+      <li><strong>Dilated / sparse attention</strong> (Longformer): 间隔抽取若干位置</li>
+      <li><strong>Linear / Mamba</strong>: 完全放弃 softmax attention，用 state-space 模型 O(T)</li>
+      <li><strong>YaRN / NTK-aware</strong>: RoPE 频率重 scaling，把 4K 训练的模型外推到 128K 推理</li>
+    </ul>
+
+    <h3>11.8.5 attention dtype 实战</h3>
+    <table>
+      <tr><th>张量</th><th>推荐 dtype</th><th>原因</th></tr>
+      <tr><td>Q, K, V (in/out)</td><td>fp16 / bf16</td><td>权重 dtype 决定</td></tr>
+      <tr><td>S (QK^T)</td><td>fp32 累加</td><td>避免 fp16 范围溢出</td></tr>
+      <tr><td>softmax exp</td><td>fp32</td><td>数值稳定</td></tr>
+      <tr><td>P (softmax 输出)</td><td>fp16</td><td>压缩 shared mem</td></tr>
+      <tr><td>O (PV 累加)</td><td>fp32</td><td>累加避免精度损失</td></tr>
+      <tr><td>最终 O (输出)</td><td>fp16 / bf16</td><td>权重 dtype</td></tr>
+    </table>
+    <p>FlashAttention 严格遵循此模式：fp16 I/O + fp32 累加。<strong>不要</strong>偷懒全 fp16，长 T 时 P @ V 会丢精度，模型输出乱。</p>
+
+    <h3>11.8.6 attention 在 LLM 推理总耗时中的占比</h3>
+    <table>
+      <tr><th>场景</th><th>attention 占比</th><th>主导算子</th></tr>
+      <tr><td>短 prompt (T=128), batch=1</td><td>~10%</td><td>FFN GEMM</td></tr>
+      <tr><td>长 prompt (T=8K) prefill</td><td>~50-70%</td><td>attention</td></tr>
+      <tr><td>decode (任意 T)</td><td>~20-40%</td><td>weight load</td></tr>
+      <tr><td>大 batch (B=64) decode</td><td>~40-60%</td><td>attention (KV 累加)</td></tr>
+    </table>
+    <p>所以：短 prompt 优化 FFN，长 prompt 优化 attention（FlashAttention），decode 优化权重加载（量化），大 batch 优化 PagedAttention。</p>
+
+    <h2 id="frontier">11.9 研究前沿（2025-2026）：MLA、线性 attention、SSM 混合、Reasoning</h2>
+
+    <h3>11.9.1 Multi-head Latent Attention (MLA) — DeepSeek 杀器</h3>
+
+    <p>DeepSeek-V2/V3 引入，<strong>KV cache 显存比 MHA 减 ~7×</strong>，是 2024 最有影响的架构创新之一。</p>
+
+<pre><code>// 标准 MHA: cache K, V shape (T, n_head, d_head), 共 2 × n_head × d_head
+// MLA: 把 K/V 投影到低维潜空间 c_kv (T, d_c)
+c_kv = X @ W_DKV    # (T, d_c)        d_c=512 远小于 n_head*d_head
+K_h  = c_kv @ W_UK[h] + position      # 各 head 上投影回 d_head
+V_h  = c_kv @ W_UV[h]
+
+// 关键: cache 的是 c_kv 而非 K/V → 7× 缩小</code></pre>
+
+    <p>工程关键："吸收"<strong>W_UK 进 W_Q</strong>，让 Q @ K^T 直接 = Q' @ c_kv^T，<strong>不必构造完整 K</strong>：</p>
+<pre><code>Q @ K^T = (Q @ W_UK^T) @ c_kv^T
+          ─────────────
+          推理时只算一次, Q' 跟着 token 走</code></pre>
+
+    <p>DeepSeek 2025 开源 <strong>FlashMLA kernel</strong>，FA v2 的 MLA 变种。MLA 已成为 2025 中国大模型主流（Qwen 3 也用）。</p>
+
+    <h3>11.9.2 Linear Attention 重生</h3>
+
+    <p>O(N²) → O(N·D²)：用 kernel function φ + 结合律：</p>
+<pre><code>softmax(QK^T) V          O(N²·D)
+       ↓ φ(Q) @ φ(K)^T 近似 + 结合律
+φ(Q) @ (φ(K)^T @ V)      O(N·D²)
+              ↑
+        (D,D) 大小, 与 N 无关</code></pre>
+
+    <p>2024-2026 主要变体：</p>
+    <ul>
+      <li><strong>Lightning Attention-2</strong>（MiniMax 2024）：右乘累加，128K 实用</li>
+      <li><strong>RWKV-7</strong>（2025）：完全 RNN-like，零 KV cache</li>
+      <li><strong>RetNet</strong>（Microsoft）：训练并行、推理 O(1) per step</li>
+      <li><strong>Gated Linear Attention (GLA)</strong>：加门控提升精度</li>
+      <li><strong>Lightning Indexer</strong>：稀疏路由 + softmax/线性混合</li>
+    </ul>
+
+    <p>评价：精度仍略输 softmax attention，但 <strong>1M+ context 唯一可行</strong>。</p>
+
+    <h3>11.9.3 Mamba / SSM 混合架构</h3>
+
+    <ul>
+      <li><strong>Mamba</strong>（2023 末）：selective SSM，跟 Transformer 同精度 + 线性复杂度</li>
+      <li><strong>Mamba-2</strong>（2024）：state space ↔ attention 对偶, 跑 Tensor Core</li>
+      <li><strong>Jamba</strong>（AI21）：Transformer + Mamba + MoE 混合, 256K context</li>
+      <li><strong>Zamba</strong> / <strong>Hymba</strong>：各种 Mamba+Attn 混合</li>
+      <li><strong>Samba</strong>（Microsoft 2024）：Mamba + 滑动窗口 attention</li>
+    </ul>
+
+    <p>共识：<strong>纯 SSM 仍不及 Transformer</strong>，但 <strong>SSM + 少量 Attention 块</strong>在长 context 推理 KV cache 大幅缩小，是产业新方向。Llama 4 据传用类似混合。</p>
+
+    <h3>11.9.4 Sparse Attention 新进展</h3>
+    <ul>
+      <li><strong>Sliding Window</strong>（Mistral/Mixtral）：固定 4K-8K 窗口</li>
+      <li><strong>Native Sparse Attention (NSA)</strong>（DeepSeek 2025）：训练学习的稀疏 pattern</li>
+      <li><strong>MoBA</strong>（Kimi 2024）：K/V 分块，attention 选 top-k 块</li>
+      <li><strong>InfLLM / Quest</strong>：路由式 KV cache 检索</li>
+    </ul>
+
+    <h3>11.9.5 Reasoning 模型对 attention 的新挑战</h3>
+
+    <p>o1 / o3 / R1 / Claude reasoning：单次回答生成 10K-100K thinking token。</p>
+    <ul>
+      <li><strong>极长 generation 的 KV cache</strong> 持续膨胀, 每 token 写入是 mem-bound</li>
+      <li><strong>动态 batch</strong>: reasoning 长度方差极大 (10K vs 100K), scheduling 难度激增</li>
+      <li><strong>Test-time compute scaling</strong>: 推理算力成为训练同等阶, 推理优化 ROI ×10</li>
+    </ul>
+
+    <p>这是 2025-2026 推理优化（FA v3/v4、FlashMLA、MoBA、Lookahead 解码）<strong>远比训练优化更受关注</strong>的原因。</p>
+
+    <h3>11.9.6 一图总结 2026 attention 全景</h3>
+
+<pre><code>           ┌─ 标准 MHA    GPT-2/3/4 老路, 已过时
+softmax    │
+attention ─┼─ GQA         Llama 2/3, Mistral — 当前实用主流
+ O(N²)     │
+           └─ MLA         DeepSeek V2/V3 — KV cache 减 7×
+
+           ┌─ Sliding W.  Mistral 7B, 长 context 推理
+sparse    ─┼─ NSA / MoBA  DeepSeek / Kimi 2025
+attention  │
+           └─ InfLLM      检索式 KV 取舍
+
+           ┌─ Lightning   MiniMax — 线性 + softmax 混合
+linear /  ─┼─ RWKV-7      纯 RNN-like, 零 KV
+SSM        │
+           ├─ Mamba-2     selective SSM, Tensor Core 友好
+           │
+           └─ Jamba/Samba SSM+Attn 混合 (产业方向)
+</code></pre>
+
+    <p>对工程师的影响：单一 attention kernel 不够。生产推理引擎需要 <strong>FlashInfer / xFormers / FlexAttention</strong> 这种"attention dispatch 层"，根据模型自动选 backend。</p>
+
+    <h2>11.10 常见坑</h2>
+    <ul>
+      <li>causal mask 写错方向（j&lt;i 还是 j&gt;i）→ 模型胡言乱语</li>
+      <li>scale 写成 D 而不是 sqrt(D) → softmax 几乎是 one-hot，模型急于自我重复</li>
+      <li>fused QKV split 时下标写错 → Q/K/V 张冠李戴，输出 nan</li>
+      <li>长 T 直接 OOM → 必须分块 / FlashAttention</li>
+      <li>MLA 没"吸收"W_UK 进 Q → 每步显式构造 K，KV 显存优化白做</li>
+      <li>用线性 attention 训练，但推理时切回 softmax → 数值分布对不上，效果暴跌</li>
+      <li>Mamba + Attn 混合模型推理时，把不同层 KV cache 当一样大小处理 → 跨层显存计算错</li>
+      <li>Reasoning 模型 max_tokens 设小（如 4K），实际 thinking 要 30K → 模型被截断输出乱码</li>
+    </ul>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch10-softmax/index.html"><span class="label">上一章</span>← 10 · Softmax</a>
+      <a class="next" href="../ch12-flashattn/index.html"><span class="label">下一章</span>12 · FlashAttention →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body></html>

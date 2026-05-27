@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 3 章 · 线程模型与索引</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head>
+<body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol>
+        <li><a href="../ch01-intro/index.html">导论与环境</a></li>
+        <li><a href="../ch02-hello/index.html">Hello CUDA</a></li>
+        <li><a href="../ch03-threads/index.html" class="current">线程模型与索引</a></li>
+        <li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li>
+      </ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5">
+        <li><a href="../ch05-memory/index.html">内存层级</a></li>
+        <li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li>
+        <li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li>
+        <li><a href="../ch08-async/index.html">性能分析与异步</a></li>
+      </ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9">
+        <li><a href="../ch09-gemm/index.html">GEMM 深入</a></li>
+        <li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li>
+        <li><a href="../ch11-attention/index.html">Attention 入门</a></li>
+        <li><a href="../ch12-flashattn/index.html">FlashAttention</a></li>
+        <li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li>
+        <li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li>
+      </ol>
+      <div class="stage">附录</div>
+      <ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 3 章 · 线程模型与索引</h1>
+    <div class="chapter-meta">
+      <span>⏱️ 45 分钟</span><span>🎯 写出 vec_add 与 mat_add</span><span>📂 code/ch03_threads/</span>
+    </div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>背熟 1D 索引公式：<code>i = blockIdx.x * blockDim.x + threadIdx.x</code></li>
+      <li>把 2D 任务映射到 2D grid + 2D block</li>
+      <li>处理"总元素数不是 block 维度整数倍"的边界情况</li>
+      <li>掌握 <span class="term" data-en="grid-stride loop">网格步长循环</span>：用固定 grid 处理任意大数组</li>
+    </ul>
+
+    <h2>3.1 线程层级回顾</h2>
+
+<pre class="mermaid">
+graph TD
+    Grid["grid<br/>gridDim.x × gridDim.y × gridDim.z"]
+    Grid --> B0["block (0,0)"]
+    Grid --> B1["block (1,0)"]
+    Grid --> Bn["block (..., ...)"]
+    B0 --> T0["thread (0,0)"]
+    B0 --> T1["thread (1,0)"]
+    B0 --> Tn["thread (..., ...)"]
+    T0 -.->|"32 个一组"| W0["warp 0"]
+    style Grid fill:#f6f8fa,stroke:#0969da
+    style W0 fill:#f6f8fa,stroke:#bf8700
+</pre>
+
+    <table>
+      <tr><th>层级</th><th>大小</th><th>共享的资源</th><th>同步原语</th></tr>
+      <tr><td>thread</td><td>1</td><td>寄存器（私有）</td><td>—</td></tr>
+      <tr><td><span class="term" data-en="warp">warp</span></td><td>32</td><td>硬件 lock-step 执行</td><td>隐式</td></tr>
+      <tr><td>block</td><td>≤ 1024</td><td>shared memory、L1</td><td><code>__syncthreads()</code></td></tr>
+      <tr><td>grid</td><td>可达数十亿</td><td>global memory</td><td>kernel 启动之间</td></tr>
+    </table>
+
+    <h2 id="mapping">3.2 索引映射公式</h2>
+
+    <p>这一节会把所有缩写讲清楚。每个 thread 在 kernel 里都需要知道"我是谁、负责处理哪一段数据"，靠的就是 CUDA 提供的 5 个只读内置变量。</p>
+
+    <h3>3.2.1 五个内置变量是什么？</h3>
+
+    <p>kernel 启动时你写两个东西：<strong>grid 大小</strong>（一共多少个 block）+ <strong>block 大小</strong>（每个 block 里多少个 thread）。CUDA 在每个 thread 里塞进 5 个变量，让它能反推自己的位置：</p>
+
+<pre><code class="language-cpp">// 假设启动：
+my_kernel&lt;&lt;&lt;4, 8&gt;&gt;&gt;();   // grid 有 4 个 block, 每 block 8 个 thread, 总共 32 thread</code></pre>
+
+    <table>
+      <tr><th>变量</th><th>类型</th><th>含义</th><th>本例的值</th></tr>
+      <tr><td><code>gridDim.x</code></td><td>unsigned int</td><td>grid 在 x 方向有多少个 block</td><td>4（每个 thread 都一样）</td></tr>
+      <tr><td><code>blockDim.x</code></td><td>unsigned int</td><td>block 在 x 方向有多少个 thread</td><td>8（每个 thread 都一样）</td></tr>
+      <tr><td><code>blockIdx.x</code></td><td>unsigned int</td><td>"我"所在 block 在 grid 里的编号</td><td>0、1、2 或 3</td></tr>
+      <tr><td><code>threadIdx.x</code></td><td>unsigned int</td><td>"我"在自己 block 里的编号</td><td>0..7</td></tr>
+      <tr><td><code>warpSize</code></td><td>const int</td><td>warp 大小，恒为 32</td><td>32</td></tr>
+    </table>
+
+    <p><strong>记忆方法</strong>：</p>
+    <ul>
+      <li><code>...Dim</code> 是<strong>规模</strong>（多大）→ 每个 thread 看到的都一样</li>
+      <li><code>...Idx</code> 是<strong>编号</strong>（我是第几个）→ 每个 thread 不同</li>
+      <li><code>grid...</code> 关于 block 数量；<code>block...</code> 关于 thread 数量</li>
+      <li><code>.x .y .z</code> 是<strong>三个独立的维度</strong>（dim3 结构体的三个字段），如果只用 1D，<code>.y</code> 和 <code>.z</code> 都自动等于 1 或 0</li>
+    </ul>
+
+    <h3>3.2.2 1D 索引：最常用</h3>
+
+    <p>"1D"指的是 grid 和 block 都只用 x 维度，把 thread 拍扁成一条直线。下图是 <code>&lt;&lt;&lt;4, 8&gt;&gt;&gt;</code> 启动后 32 个 thread 的排布：</p>
+
+<pre><code>block 0:  [T0  T1  T2  T3  T4  T5  T6  T7]   ← blockIdx.x=0
+block 1:  [T0  T1  T2  T3  T4  T5  T6  T7]   ← blockIdx.x=1
+block 2:  [T0  T1  T2  T3  T4  T5  T6  T7]   ← blockIdx.x=2
+block 3:  [T0  T1  T2  T3  T4  T5  T6  T7]   ← blockIdx.x=3
+           ↑                           ↑
+           threadIdx.x=0               threadIdx.x=7
+
+希望的 gid (global id) :
+block 0:   0   1   2   3   4   5   6   7
+block 1:   8   9  10  11  12  13  14  15
+block 2:  16  17  18  19  20  21  22  23
+block 3:  24  25  26  27  28  29  30  31</code></pre>
+
+    <p>规律：block <code>k</code> 的 thread <code>t</code> 对应 gid = <code>k × 8 + t</code>。把 "8" 换成 <code>blockDim.x</code>（block 多大）：</p>
+
+<pre><code class="language-cpp">int gid = blockIdx.x * blockDim.x + threadIdx.x;
+//        ─────────────────────────   ───────────
+//        前面有几个 block × 每个多大   再加上 block 内的位置
+//        (= 前面已经"用掉"几个 gid)    (我在 block 内排第几)</code></pre>
+
+    <p><strong>具体例子</strong>：</p>
+    <table>
+      <tr><th>blockIdx.x</th><th>blockDim.x</th><th>threadIdx.x</th><th>gid 计算</th><th>gid</th></tr>
+      <tr><td>0</td><td>8</td><td>5</td><td>0×8 + 5</td><td>5</td></tr>
+      <tr><td>2</td><td>8</td><td>3</td><td>2×8 + 3</td><td>19</td></tr>
+      <tr><td>3</td><td>8</td><td>7</td><td>3×8 + 7</td><td>31</td></tr>
+    </table>
+
+    <p>把 <code>gid</code> 当成"我要处理数组的第几号元素"，就能写 vec_add：<code>c[gid] = a[gid] + b[gid]</code>。</p>
+
+    <h3>3.2.3 为什么还要 2D / 3D？</h3>
+
+    <p>纯粹是<strong>写代码方便</strong>。1D 也能处理矩阵（手动 row×cols+col 算），但 2D 让坐标自动浮现。维度只影响内置变量怎么编号，<strong>硬件并不在乎</strong>——总线程数 = <code>gridDim.x × gridDim.y × gridDim.z × blockDim.x × blockDim.y × blockDim.z</code>。</p>
+
+    <table>
+      <tr><th>维度</th><th>常见用途</th><th>例子</th></tr>
+      <tr><td>1D</td><td>数组、向量、token 序列</td><td>vec_add、softmax 每行</td></tr>
+      <tr><td>2D</td><td>矩阵、图像、attention scores</td><td>matmul、卷积、transpose</td></tr>
+      <tr><td>3D</td><td>体数据、多 head 多 token</td><td>3D 卷积、医学影像、batched attention</td></tr>
+    </table>
+
+    <h3>3.2.4 2D 索引推导</h3>
+
+    <p>2D 启动语法：</p>
+<pre><code class="language-cpp">dim3 block(16, 16);                       // 每 block 16×16 = 256 thread
+dim3 grid((N + 15) / 16, (M + 15) / 16);  // 多少 block 才能盖住 M×N 矩阵
+my_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...);
+
+// 在 kernel 内:
+// gridDim.x = (N+15)/16,  gridDim.y = (M+15)/16
+// blockDim.x = 16,        blockDim.y = 16
+// blockIdx.x ∈ [0, gridDim.x),  blockIdx.y ∈ [0, gridDim.y)
+// threadIdx.x ∈ [0, 16),        threadIdx.y ∈ [0, 16)</code></pre>
+
+    <p>下图是一个 grid（2×2 个 block，每 block 是 2×2 thread，共 16 thread）的排布。每个小方格是一个 thread：</p>
+
+<pre><code>           blockIdx.x=0           blockIdx.x=1
+         ┌─────┬─────┐         ┌─────┬─────┐
+blockIdx │tx=0 │tx=1 │         │tx=0 │tx=1 │   ← threadIdx 是 block 内坐标
+ .y=0    │ty=0 │ty=0 │         │ty=0 │ty=0 │
+         ├─────┼─────┤         ├─────┼─────┤
+         │tx=0 │tx=1 │         │tx=0 │tx=1 │
+         │ty=1 │ty=1 │         │ty=1 │ty=1 │
+         └─────┴─────┘         └─────┴─────┘
+         ┌─────┬─────┐         ┌─────┬─────┐
+blockIdx │ ...                                │   ← y=1 的两个 block
+ .y=1    │
+         └─────┴─────┘         └─────┴─────┘
+
+全局坐标 (col, row) 想要的是:
+(0,0) (1,0) | (2,0) (3,0)
+(0,1) (1,1) | (2,1) (3,1)
+─────────────────────────
+(0,2) (1,2) | (2,2) (3,2)
+(0,3) (1,3) | (2,3) (3,3)</code></pre>
+
+    <p>把 1D 的公式套到两个维度上：</p>
+<pre><code class="language-cpp">int col = blockIdx.x * blockDim.x + threadIdx.x;   // 全局 x 坐标 ∈ [0, N)
+int row = blockIdx.y * blockDim.y + threadIdx.y;   // 全局 y 坐标 ∈ [0, M)</code></pre>
+
+    <div class="callout">
+      <strong>⚠️ x ↔ col、y ↔ row 是 CUDA 的约定。</strong>看似随意，实则关乎性能：warp 是按 <code>threadIdx.x</code> 变化最快的方式打包 32 个 lane 的。让 <code>.x</code> 走 col → 同一 warp 内 32 个 lane 访问<strong>同一行的相邻 32 列</strong> → 内存连续 → coalesced。反过来让 <code>.x</code> 走 row 会让 warp 跳着访问，性能掉 10× 以上（第 5 章细讲）。
+    </div>
+
+    <h3>3.2.5 (row, col) → 一维内存索引</h3>
+
+    <p>关键认知：<strong>C/C++ 里的二维数组在内存中是一维存储的</strong>，按 <span class="term" data-en="row-major">行优先</span>顺序排：先把第 0 行全部存完，再存第 1 行……</p>
+
+<pre><code>矩阵 A (M=3 行, N=4 列):
+     列: 0   1   2   3
+行 0:    A00 A01 A02 A03
+行 1:    A10 A11 A12 A13
+行 2:    A20 A21 A22 A23
+
+在内存里实际是一个长度 12 的数组:
+idx:    0   1   2   3   4   5   6   7   8   9   10  11
+flat:  A00 A01 A02 A03 A10 A11 A12 A13 A20 A21 A22 A23
+       └─── 行 0 ───┘ └─── 行 1 ───┘ └─── 行 2 ───┘</code></pre>
+
+    <p>所以 (row, col) → idx 的公式：</p>
+<pre><code class="language-cpp">int idx = row * cols + col;
+//        ─────────   ───
+//        跳过前 row    再加本行内
+//        整行 (每行     的列位置
+//        cols 个元素)</code></pre>
+
+    <p><strong>具体例子</strong>（M=3 行 N=4 列）：</p>
+    <table>
+      <tr><th>(row, col)</th><th>idx = row × 4 + col</th><th>对应元素</th></tr>
+      <tr><td>(0, 0)</td><td>0</td><td>A00</td></tr>
+      <tr><td>(0, 3)</td><td>3</td><td>A03</td></tr>
+      <tr><td>(1, 0)</td><td>4</td><td>A10</td></tr>
+      <tr><td>(2, 3)</td><td>11</td><td>A23</td></tr>
+    </table>
+
+    <h3>3.2.6 3D 索引推导</h3>
+
+    <p>3D 用于<strong>体数据</strong>——比如视频 (帧, 高, 宽)、医学 CT (深度, 高, 宽)、3D 卷积。约定：</p>
+    <ul>
+      <li><code>x</code> ↔ W (width，宽度，最快变化的维度)</li>
+      <li><code>y</code> ↔ H (height，高度)</li>
+      <li><code>z</code> ↔ D (depth，深度，最慢变化的维度)</li>
+    </ul>
+
+<pre><code class="language-cpp">// kernel 内三个全局坐标
+int x = blockIdx.x * blockDim.x + threadIdx.x;   // 0 .. W-1
+int y = blockIdx.y * blockDim.y + threadIdx.y;   // 0 .. H-1
+int z = blockIdx.z * blockDim.z + threadIdx.z;   // 0 .. D-1</code></pre>
+
+    <p>三维 row-major 内存布局——按 z 最慢、y 居中、x 最快变化的顺序排：</p>
+
+<pre><code>体数据 shape = (D=2, H=3, W=4) 共 24 个元素
+
+z=0 层 (3×4):              z=1 层 (3×4):
+  V[0,0,0] V[0,0,1] ...     V[1,0,0] V[1,0,1] ...
+  V[0,1,0] V[0,1,1] ...     V[1,1,0] ...
+  V[0,2,0] ...              V[1,2,0] ...
+
+内存里:
+idx:     0..3      4..7      8..11   |  12..15    16..19    20..23
+flat:  z=0,y=0 |  z=0,y=1 |  z=0,y=2 | z=1,y=0 | z=1,y=1 | z=1,y=2
+       └────── z=0 整层 (H*W=12) ────┘ └────── z=1 整层 ──────┘</code></pre>
+
+<pre><code class="language-cpp">int idx = (z * H + y) * W + x;
+//      = z * (H * W) + y * W + x;
+//        ──────────   ─────   ─
+//        跳过 z 整层    跳过    本行内
+//        (每层 H*W      本层    x 列
+//         个元素)       内 y 行
+//                       (每行 W
+//                        个元素)</code></pre>
+
+    <p><strong>具体例子</strong> (D=2, H=3, W=4)：</p>
+    <table>
+      <tr><th>(z, y, x)</th><th>idx 计算</th><th>idx</th></tr>
+      <tr><td>(0, 0, 0)</td><td>(0×3+0)×4 + 0</td><td>0</td></tr>
+      <tr><td>(0, 2, 3)</td><td>(0×3+2)×4 + 3</td><td>11</td></tr>
+      <tr><td>(1, 0, 0)</td><td>(1×3+0)×4 + 0</td><td>12</td></tr>
+      <tr><td>(1, 2, 3)</td><td>(1×3+2)×4 + 3</td><td>23</td></tr>
+    </table>
+
+    <h3>3.2.7 通用记忆口诀</h3>
+
+    <p>不论几维，多维数组在 row-major 内存里的索引公式都是<strong>"从最慢变的维度向最快变的维度逐层乘进去"</strong>：</p>
+<pre><code>shape = (d_0, d_1, d_2, ..., d_n)  // d_0 最慢, d_n 最快
+idx   = (((i_0 * d_1 + i_1) * d_2 + i_2) * d_3 + ... ) * d_n + i_n</code></pre>
+
+    <p>1D / 2D / 3D 都是这个公式的特例：</p>
+<pre><code>1D: idx = i
+2D: idx = i * cols + j               = (i) * cols + j
+3D: idx = (z * H + y) * W + x        = ((z) * H + y) * W + x
+4D: idx = ((b * D + z) * H + y) * W + x   // 多了 batch 维度</code></pre>
+
+    <p>记住这一条，以后看 PyTorch / cuBLAS / FlashAttention 的张量布局都不会迷路。</p>
+
+    <h3>3.2.8 跑代码看实际映射</h3>
+    <p>跑 <a href="../../code/ch03_threads/thread_id_map.cu">thread_id_map.cu</a> 打印每个 thread 的 (blockIdx, threadIdx, warp_id, lane_id, gid)：</p>
+<pre><code>blk=0  tid= 0  warp=0  lane= 0  gid= 0
+blk=0  tid= 1  warp=0  lane= 1  gid= 1
+...
+blk=0  tid=31  warp=0  lane=31  gid=31
+blk=0  tid=32  warp=1  lane= 0  gid=32   ← 新 warp 开始 (每 32 thread 一个 warp)
+blk=0  tid=33  warp=1  lane= 1  gid=33
+...
+blk=1  tid= 0  warp=0  lane= 0  gid=40   ← 新 block 重置 warp/lane，但 gid 接着涨</code></pre>
+    <p>注意：<strong>warp 和 lane 是 block 内的概念，每进入新 block 都重置</strong>；但 gid 是全局连续的。</p>
+
+    <h2 id="vec-add">3.3 向量加：边界与 grid-stride loop</h2>
+    <p>源码：<a href="../../code/ch03_threads/vec_add.cu">vec_add.cu</a>。</p>
+
+    <h3>版本 1：一线程一元素</h3>
+<pre><code class="language-cpp">__global__ void vec_add_v1(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) c[i] = a[i] + b[i];      // <-- 边界检查必须有
+}
+
+// host:
+int block = 256;
+int grid  = (N + block - 1) / block;     // 向上取整
+vec_add_v1&lt;&lt;&lt;grid, block&gt;&gt;&gt;(a, b, c, N);</code></pre>
+
+    <p>问题：N 巨大时 grid 也会巨大；某些老 GPU 上 grid 维度有上限（虽然现在 2³¹ 通常够用）。更好的写法是<strong>固定 grid 大小，每线程处理多个元素</strong>：</p>
+
+    <h3>版本 2：grid-stride loop</h3>
+<pre><code class="language-cpp">__global__ void vec_add_grid_stride(const float* a, const float* b, float* c, int n) {
+    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;          // 总线程数
+    for (int i = tid; i &lt; n; i += stride)
+        c[i] = a[i] + b[i];
+}
+
+// host:
+vec_add_grid_stride&lt;&lt;&lt;1024, 256&gt;&gt;&gt;(a, b, c, N);   // 任意大 N 都能跑</code></pre>
+
+    <div class="callout">
+      <strong>为什么 grid-stride loop 更受欢迎？</strong>
+      ① 解耦 grid 维度与数据大小，方便调 occupancy；
+      ② kernel 启动开销摊薄（一次 launch 处理 4× 数据）；
+      ③ 编译器更容易做循环展开、预取优化。
+    </div>
+
+    <h2 id="matrix-add">3.4 矩阵加：2D 索引</h2>
+    <p>把上面公式套到 2D。源码：<a href="../../code/ch03_threads/matrix_add.cu">matrix_add.cu</a>。</p>
+<pre><code class="language-cpp">__global__ void mat_add_2d(const float* A, const float* B, float* C, int M, int N) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row &lt; M &amp;&amp; col &lt; N) {
+        int idx = row * N + col;
+        C[idx] = A[idx] + B[idx];
+    }
+}
+
+// host:
+dim3 block(16, 16);                                       // 256 threads/block
+dim3 grid((N + block.x - 1) / block.x,
+          (M + block.y - 1) / block.y);
+mat_add_2d&lt;&lt;&lt;grid, block&gt;&gt;&gt;(A, B, C, M, N);</code></pre>
+
+    <p>注意：x 维度对应 col、y 维度对应 row。原因是 warp 是按 <code>threadIdx.x</code> 变化最快的方式打包的——
+       让 <code>x</code> 走 col 才能让同一 warp 内 32 个线程访问<strong>相邻列</strong>，从而满足 coalescing（下章会细讲）。</p>
+
+    <h2>3.5 block 大小怎么选？</h2>
+    <p>经验法则（之后第 5、8 章会用 Nsight 验证）：</p>
+    <ul>
+      <li><strong>1D：256 / 512</strong> 通常是最佳起点</li>
+      <li><strong>2D：16×16 或 32×8</strong>（都 = 256），方阵任务用 16×16</li>
+      <li>必须是 32 的倍数（一个 warp 是 32）</li>
+      <li>太小（&lt; 64）→ warp 不满，浪费硬件</li>
+      <li>太大（&gt; 1024）→ 直接编译失败</li>
+    </ul>
+
+    <h2>3.6 自检清单</h2>
+    <details><summary>Q1: 为什么不直接用 N 个 block，每 block 1 个 thread？</summary>
+      <p>warp 必须 32 个 thread 才能填满一次发射。1 thread / block 浪费 31/32 = 97% 的算力，性能崩塌。</p>
+    </details>
+    <details><summary>Q2: 2D block 用 8×32 还是 32×8？</summary>
+      <p>取决于你想让 warp 内的 32 个线程在哪个维度上连续。row-major 数据用 32×8（x = 32 → 列连续）才能 coalesce。</p>
+    </details>
+    <details><summary>Q3: <code>(N + block - 1) / block</code> 这个公式干嘛？</summary>
+      <p>整数除法的"向上取整"——比 <code>ceil(N / block)</code> 更准确（避开 float 误差），是 CUDA 代码里最常见的样板。</p>
+    </details>
+    <details><summary>Q4: grid-stride loop 里 <code>stride = blockDim.x * gridDim.x</code>，为什么不算 z/y 维？</summary>
+      <p>这个例子里只有 1D grid。如果是多维，stride 要乘上所有维度的乘积。多维 grid-stride 比较少用——一般直接展开成 1D。</p>
+    </details>
+    <details><summary>Q5: kernel 内能用 STL（如 <code>std::sort</code>）吗？</summary>
+      <p>不能。device 代码只支持 C++ 的<strong>子集</strong>（无异常、无虚函数指针逃逸、有限的 STL）。用 Thrust 或者 cub 提供的 device-side 容器。</p>
+    </details>
+
+    <h2>3.7 练习</h2>
+    <ol>
+      <li><a href="../../code/ch03_threads/exercises/01_image_invert_starter.cu">01_image_invert_starter.cu</a>：写出灰度图反相 <code>y = 255 - x</code>。</li>
+      <li>改 <code>vec_add.cu</code> 的 block 大小为 32、64、128、256、512、1024，记录带宽。哪个最快？</li>
+      <li>实现 <strong>3D 张量加</strong>：<code>D = A + B + C</code>，<code>A.shape = (D, H, W) = (16, 64, 128)</code>。</li>
+    </ol>
+
+    <h2 id="industry">3.8 工业实战：block 选择、launch_bounds、批量 indexing</h2>
+
+    <h3>3.8.1 block 大小：production 选择速查</h3>
+
+    <p>3.5 给了"256/512 是起点"的经验，工业上还需细分。下表是 production kernel 实测的常用配置：</p>
+
+    <table>
+      <tr><th>kernel 类型</th><th>典型 block</th><th>原因</th></tr>
+      <tr><td>vec_add / element-wise</td><td>256, 1D</td><td>足够多 warp 隐藏访存</td></tr>
+      <tr><td>reduce / norm</td><td>256 或 512, 1D</td><td>多于 256 warp 间通信开销大</td></tr>
+      <tr><td>matmul (fp32)</td><td>16×16 = 256, 2D</td><td>方阵 tile 自然映射</td></tr>
+      <tr><td>matmul (fp16 + WMMA)</td><td>128 (= 4 warp), 1D</td><td>每 warp 算一个 16×16 fragment</td></tr>
+      <tr><td>FlashAttention</td><td>128 (= 4 warp), 1D</td><td>同上 + warp-level QK 计算</td></tr>
+      <tr><td>conv2d</td><td>32×8 或 16×16</td><td>x 维 32 让 warp 沿宽度 coalesce</td></tr>
+      <tr><td>sampling / argmax (V=50K)</td><td>256, 1D</td><td>单 block reduce 够用</td></tr>
+    </table>
+
+    <p><strong>四条铁律</strong>：</p>
+    <ol>
+      <li><strong>必是 32 的倍数</strong>——否则 warp 不满，浪费</li>
+      <li><strong>2D 时 x 维至少 16 或 32</strong>——保证 warp 内访存连续</li>
+      <li><strong>总 thread &lt;= 1024</strong>——硬上限</li>
+      <li><strong>用 occupancy API 验证</strong>，不要靠猜</li>
+    </ol>
+
+<pre><code class="language-cpp">// 让 runtime 帮你选最优 block size (occupancy 最高)
+int min_grid, best_block;
+cudaOccupancyMaxPotentialBlockSize(
+    &amp;min_grid, &amp;best_block, my_kernel, /*dynShm=*/0, /*blockLimit=*/0);
+// best_block 是当前 kernel 在此 GPU 上的 occupancy-optimal 选择</code></pre>
+
+    <h3>3.8.2 <code>__launch_bounds__</code> — 让编译器替你优化</h3>
+
+    <p>编译器默认假设 kernel 可能用最大 1024 thread/block，会保守限制寄存器使用。如果你已经知道实际不会超过 256，告诉它能让单 thread 用更多寄存器（提升 ILP）：</p>
+
+<pre><code class="language-cpp">// 第 1 参数: 最大 thread/block (=blockDim 上限)
+// 第 2 参数: 期望每 SM 至少驻留几个 block
+__global__
+__launch_bounds__(256, 4)              // 256 thread/block, 想驻留 4 block/SM
+void my_kernel(...) { ... }</code></pre>
+
+    <p>编译器据此分配寄存器（256×4 = 1024 thread/SM → 每 thread 最多 64 reg @A100）。
+       如果你的 kernel 用得太多触发 spill 到 local mem，<strong>不加这个 hint 性能可能掉 30%</strong>。生产 kernel 几乎都加。</p>
+
+    <h3>3.8.3 batched indexing（4D+）：LLM 张量布局基本功</h3>
+
+    <p>LLM 推理张量通常是 4D 或 5D：</p>
+<pre><code>Q, K, V        : (Batch, n_Head, T, Dh)        // 4D
+KV cache       : (n_Layer, Batch, n_Head, T_max, Dh)  // 5D
+attention mask : (Batch, T_q, T_kv)            // 3D</code></pre>
+
+    <p>套用 3.2.7 的通用公式（最慢 → 最快）：</p>
+<pre><code class="language-cpp">// Q shape (B, H, T, Dh), 找元素 Q[b, h, t, d]
+int idx = ((b * H + h) * T + t) * Dh + d;
+
+// KV cache shape (L, B, H, T_max, Dh)
+int idx = (((l * B + b) * H + h) * T_max + t) * Dh + d;</code></pre>
+
+    <p>工业实践：把这些索引算法<strong>封装成 inline device helper</strong>，kernel 里只调函数，减少出错：</p>
+<pre><code class="language-cpp">struct QKVLayout {
+    int B, H, T, Dh;
+    __device__ int idx(int b, int h, int t, int d) const {
+        return ((b * H + h) * T + t) * Dh + d;
+    }
+};
+
+__global__ void rotate_q(float* Q, QKVLayout L) {
+    int b = blockIdx.z, h = blockIdx.y, t = blockIdx.x;
+    int d = threadIdx.x;
+    int i = L.idx(b, h, t, d);
+    /* ... */
+}</code></pre>
+
+    <h3>3.8.4 一个真实 bug：T=2049 时多算一行</h3>
+
+    <p>真实部署：某 LLM kernel 在 T=2048 时完美正常，T=2049 时输出末尾 NaN。原因：</p>
+<pre><code class="language-cpp">// 错: T=2049, block=256 → grid=ceil(2049/256)=9, 总 thread=2304
+// 最后 block 的部分 thread 不在 [0, T), 但 if 漏写
+int t = blockIdx.x * blockDim.x + threadIdx.x;
+out[t] = compute(...);     // <-- t 可以到 2303, 越界写
+
+// 对:
+if (t &lt; T) out[t] = compute(...);
+</code></pre>
+    <p>边界检查永远不要漏。<strong>测试 size 不是 block 整数倍</strong>是 CI 必跑的 case（T=1, T=33, T=257, T=2049）。</p>
+
+    <h3>3.8.5 grid 维度的硬上限</h3>
+    <table>
+      <tr><th>维度</th><th>上限 (Compute Capability 3.5+)</th></tr>
+      <tr><td>gridDim.x</td><td>2³¹ − 1 ≈ 2.1B</td></tr>
+      <tr><td>gridDim.y</td><td>65535</td></tr>
+      <tr><td>gridDim.z</td><td>65535</td></tr>
+      <tr><td>blockDim.{x,y,z}</td><td>各 1024, 总积 ≤ 1024</td></tr>
+    </table>
+    <p>实际碰得到的只有 <code>gridDim.y / z</code>。Batched matmul 时 B = batch_size，如果 B &gt; 65535 会启动失败。<strong>规避</strong>：把 batch 维放到 <code>gridDim.x</code>（容量大），或者用 grid-stride loop。</p>
+
+    <h2 id="frontier">3.9 研究前沿（2025-2026）：CTA Cluster 与新线程层级</h2>
+
+    <p>Hopper（sm_90）在 grid → block → thread → warp 之间又塞了一层 <strong>CTA cluster</strong>（也叫 thread block cluster），Blackwell（sm_100）保留并扩展。这是<strong>2024 之后的 LLM kernel</strong>大量在用的新特性。</p>
+
+    <h3>3.9.1 什么是 CTA Cluster</h3>
+
+    <p>新的层级关系：</p>
+<pre>
+旧 (sm_80 及更早):     grid &gt; block (= CTA) &gt; warp &gt; thread
+新 (sm_90+):           grid &gt; cluster &gt; block &gt; warp &gt; thread
+</pre>
+
+    <p>cluster 是<strong>2-16 个 block 的组合</strong>，强制调度到同一 GPC（Graphics Processing Cluster，A100 有 7 个 GPC，H100 有 8 个）。cluster 内的 block 之间可以：</p>
+    <ul>
+      <li><strong>共享 shared memory</strong>（distributed shared memory, DSMEM）</li>
+      <li><strong>用 mbarrier 同步</strong>（fine-grained barrier）</li>
+      <li><strong>互相用 cluster atomic</strong></li>
+    </ul>
+
+    <p>本质：<strong>把"shared memory 共享"的边界从 1 个 block 扩到 8-16 个 block</strong>。可用 shared 总量从 228 KB 单 SM 升到 ~2 MB（H100）。</p>
+
+    <h3>3.9.2 启动 cluster 的代码</h3>
+
+<pre><code class="language-cpp">// 1) kernel 声明 cluster 大小（编译期）
+__global__ void __cluster_dims__(2, 2, 1)
+my_kernel(...) {
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    int cluster_rank = cluster.block_rank();        // 0..3 (这个 block 在 cluster 里第几)
+    int cluster_size = cluster.num_blocks();        // 4
+
+    // 用 cluster 内其他 block 的 shared memory
+    extern __shared__ float smem[];
+    float* peer_smem = cluster.map_shared_rank(smem, /*peer=*/1);
+    peer_smem[0] = 42.0f;                            // 写到 block 1 的 shared!
+    cluster.sync();                                  // cluster 级同步
+}
+
+// 2) host 侧也可以动态指定 cluster
+cudaLaunchConfig_t config = {};
+config.gridDim = grid;
+config.blockDim = block;
+cudaLaunchAttribute attr;
+attr.id = cudaLaunchAttributeClusterDimension;
+attr.val.clusterDim = {2, 2, 1};
+config.attrs = &amp;attr;  config.numAttrs = 1;
+cudaLaunchKernelEx(&amp;config, my_kernel, args...);</code></pre>
+
+    <h3>3.9.3 为什么 cluster 对 LLM 重要</h3>
+
+    <p>FlashAttention v3 / FlashMLA / FlashInfer 等新一代 attention kernel 都用 cluster：</p>
+    <ul>
+      <li><strong>Producer-Consumer warp specialization</strong>：cluster 内 1 个 block 做 load（producer），另几个 block 做 compute（consumer），通过 DSMEM 传递</li>
+      <li><strong>大 tile 突破 shared 上限</strong>：单 block shared 限 228 KB；cluster 4 block 可用 ~900 KB → 装得下 128×128 fp16 tile 三阶段流水</li>
+      <li><strong>同步开销低</strong>：cluster.sync() 比 grid sync 快几个数量级</li>
+    </ul>
+
+    <h3>3.9.4 Blackwell 的进一步演进</h3>
+
+    <p>sm_100（Blackwell）改进：</p>
+    <ul>
+      <li><strong>2-CTA cluster MMA</strong>：两个 block 协作完成一个 fp4 / fp8 大 MMA，跨 SM 流水</li>
+      <li><strong>Tensor Memory (TMEM)</strong>：每 SM 单独的 256 KB tensor 存储（独立于 shared），专为 MMA accumulator 设计</li>
+      <li><strong>UMMA / TCGEN05</strong>：新一代 MMA 指令族，吞吐再翻一倍</li>
+    </ul>
+
+    <h3>3.9.5 什么时候用 cluster</h3>
+
+    <table>
+      <tr><th>场景</th><th>用 cluster?</th></tr>
+      <tr><td>普通 element-wise / GEMV</td><td>不需要</td></tr>
+      <tr><td>普通 GEMM（M, N 都大）</td><td>可选，收益 5-15%</td></tr>
+      <tr><td>FlashAttention v3+（H100）</td><td><strong>必须</strong>，warp specialization 需要</td></tr>
+      <tr><td>长 context（T &gt; 32K）</td><td>推荐，DSMEM 让 tile 更大</td></tr>
+      <tr><td>FA v4 / FlashMLA</td><td><strong>必须</strong></td></tr>
+      <tr><td>fp4 GEMM (Blackwell)</td><td><strong>必须</strong>，2-CTA MMA 强制 cluster</td></tr>
+    </table>
+
+    <h3>3.9.6 线程层级速查（2026 版）</h3>
+
+<pre><code>┌─ grid (整个 kernel launch)
+│  ├─ cluster (sm_90+, 2-16 blocks)            ← 新层级
+│  │  ├─ block / CTA (≤ 1024 threads)
+│  │  │  ├─ warp (32 threads, lockstep)
+│  │  │  │  └─ thread
+│  │  │  └─ ...
+│  │  └─ ...
+│  └─ ...
+└─
+
+每层级的<strong>同步原语</strong>:
+  thread:   寄存器, 无需同步
+  warp:     __shfl_sync / __syncwarp() / lockstep
+  block:    __syncthreads() / cg::this_thread_block().sync()
+  cluster:  cluster.sync() / mbarrier (Hopper+)
+  grid:     kernel 启动边界 / cooperative launch + cg::this_grid().sync()</code></pre>
+
+    <p>建议路径：本教程 Ch3-Ch12 重点学传统四层（grid/block/warp/thread），实战阶段（Ch12 FA + 实际项目）再补 cluster 层。</p>
+
+    <h2>3.10 常见坑</h2>
+    <ul>
+      <li>忘记边界 if → 越界写，cudaDeviceSynchronize 报 <code>illegal memory access</code></li>
+      <li>block 维度写成 1024×1024 → 总线程数超 1024 上限，启动失败</li>
+      <li>2D 索引 row/col 写反 → 性能正确但 cache miss 飙升（下章细讲）</li>
+    </ul>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch02-hello/index.html"><span class="label">上一章</span>← 02 · Hello CUDA</a>
+      <a class="next" href="../ch04-arch/index.html"><span class="label">下一章</span>04 · GPU 硬件架构 →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body>
+</html>

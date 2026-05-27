@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><!-- CH_TITLE --> · CUDA × LLM 推理教程</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head>
+<body>
+
+<div id="layout">
+  <!-- ====== SIDEBAR (kept identical across all chapters) ===================== -->
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol>
+        <li><a href="../ch01-intro/index.html">导论与环境</a></li>
+        <li><a href="../ch02-hello/index.html">Hello CUDA</a></li>
+        <li><a href="../ch03-threads/index.html">线程模型与索引</a></li>
+        <li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li>
+      </ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5">
+        <li><a href="../ch05-memory/index.html">内存层级</a></li>
+        <li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li>
+        <li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li>
+        <li><a href="../ch08-async/index.html">性能分析与异步</a></li>
+      </ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9">
+        <li><a href="../ch09-gemm/index.html">GEMM 深入</a></li>
+        <li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li>
+        <li><a href="../ch11-attention/index.html">Attention 入门</a></li>
+        <li><a href="../ch12-flashattn/index.html">FlashAttention</a></li>
+        <li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li>
+        <li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li>
+      </ol>
+      <div class="stage">附录</div>
+      <ol style="counter-reset: ch -1">
+        <li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <!-- ====== MAIN CONTENT ============================================== -->
+  <main>
+    <!-- CH_BODY -->
+
+    <nav class="chapter-nav">
+      <a class="prev" href="<!-- CH_PREV_HREF -->">
+        <span class="label">上一章</span>
+        <!-- CH_PREV_TITLE -->
+      </a>
+      <a class="next" href="<!-- CH_NEXT_HREF -->">
+        <span class="label">下一章</span>
+        <!-- CH_NEXT_TITLE -->
+      </a>
+    </nav>
+  </main>
+</div>
+
+<!-- ====== SCRIPTS ====================================================== -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body>
+</html>

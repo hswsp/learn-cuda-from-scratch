@@ -1,0 +1,75 @@
+# Build artifacts
+*.o
+*.obj
+*.exe
+*.out
+
+# CUDA binaries (no extension, mark by location)
+code/**/device_query
+code/**/bandwidth_estimate
+code/**/hello
+code/**/host_device_memcpy
+code/**/error_handling
+code/**/vec_add
+code/**/matrix_add
+code/**/thread_id_map
+code/**/warp_divergence
+code/**/occupancy_probe
+code/**/coalesce_vs_strided
+code/**/mem_modes
+code/**/shared_demo
+code/**/constant_demo
+code/**/matmul_naive
+code/**/matmul_tiled
+code/**/transpose
+code/**/reduce_v1_to_v5
+code/**/scan
+code/**/histogram
+code/**/multi_stream
+code/**/cuda_graph_demo
+code/**/gemm_register_tile
+code/**/gemm_wmma
+code/**/gemm_cublas
+code/**/softmax
+code/**/online_softmax
+code/**/rmsnorm
+code/**/attention_naive
+code/**/fused_qkv
+code/**/flash_attn_v1
+code/**/rope
+code/**/swiglu
+code/**/kv_cache
+code/**/sampling
+code/**/mini_llm
+
+# Profile reports
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# Model weights (large)
+data/*.bin
+data/*.safetensors
+data/*.pt
+data/*.gguf
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local server logs
+/tmp/srv.log

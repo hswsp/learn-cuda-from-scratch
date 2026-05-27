@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 1 章 · 导论与环境</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head>
+<body>
+
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol>
+        <li><a href="../ch01-intro/index.html" class="current">导论与环境</a></li>
+        <li><a href="../ch02-hello/index.html">Hello CUDA</a></li>
+        <li><a href="../ch03-threads/index.html">线程模型与索引</a></li>
+        <li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li>
+      </ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5">
+        <li><a href="../ch05-memory/index.html">内存层级</a></li>
+        <li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li>
+        <li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li>
+        <li><a href="../ch08-async/index.html">性能分析与异步</a></li>
+      </ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9">
+        <li><a href="../ch09-gemm/index.html">GEMM 深入</a></li>
+        <li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li>
+        <li><a href="../ch11-attention/index.html">Attention 入门</a></li>
+        <li><a href="../ch12-flashattn/index.html">FlashAttention</a></li>
+        <li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li>
+        <li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li>
+      </ol>
+      <div class="stage">附录</div>
+      <ol style="counter-reset: ch -1">
+        <li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 1 章 · 导论与环境</h1>
+    <div class="chapter-meta">
+      <span>⏱️ 预计 30 分钟</span>
+      <span>🎯 跑通 deviceQuery</span>
+      <span>📂 code/ch01_intro/</span>
+    </div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>明白 GPU 与 CPU 的根本差异（"很多笨工人" vs "几个聪明工人"）</li>
+      <li>装好 CUDA Toolkit / 或者会用 Google Colab 替代</li>
+      <li>第一次跑出自己 GPU 的 deviceQuery 输出，能解读每一行</li>
+      <li>测出本机的内存拷贝带宽（H2D / D2H / D2D），知道为什么以后要用 pinned memory</li>
+    </ul>
+
+    <h2>前置知识</h2>
+    <p>会用 gcc/clang 编译 C++17 程序；能在终端里运行 <code>make</code>；理解什么是<span class="term" data-en="heap / stack">堆栈</span>和指针。<strong>不需要</strong>任何 GPU / 并行编程经验。</p>
+
+    <h2>1.1 为什么是 CUDA？</h2>
+    <p>
+      大模型推理本质上是一连串<strong>巨大的矩阵乘 + 元素级运算</strong>。
+      CPU 一次处理几路（4~64 线程），GPU 一次能并行处理几万路。
+      以 NVIDIA A100 为例：6912 个 CUDA core + 432 个 Tensor Core，
+      理论 fp16 算力 312 TFLOPS，是顶级桌面 CPU 的 100 倍以上。
+    </p>
+
+<pre class="mermaid">
+graph LR
+    subgraph CPU
+      C1["Core × 4-64"] --> Cmem["DRAM<br/>~50 GB/s"]
+    end
+    subgraph GPU
+      G1["CUDA core × 数千"] --> Gmem["HBM 显存<br/>~1-3 TB/s"]
+      G1 --> TC["Tensor Core<br/>专攻 MMA"]
+    end
+    style C1 fill:#f6f8fa,stroke:#0969da
+    style G1 fill:#f6f8fa,stroke:#1a7f37
+    style TC fill:#f6f8fa,stroke:#bf8700
+</pre>
+
+    <p>关键差距不只在"核数"，更在<strong>内存带宽</strong>：A100 的 HBM2e 带宽 ~1.5 TB/s，是 DDR5 内存的 30 倍。
+       LLM 推理是<span class="term" data-en="memory-bound">访存瓶颈</span>主导的工作负载（小 batch 下尤其明显），这是为什么 GPU 是必需品。</p>
+
+    <h2 id="setup">1.2 环境准备（三选一）</h2>
+
+    <h3 id="colab">方式 A · Google Colab（推荐初学者，免费）</h3>
+    <ol>
+      <li>打开 <a href="https://colab.research.google.com" target="_blank">colab.research.google.com</a></li>
+      <li>菜单：Runtime → Change runtime type → Hardware accelerator: <strong>T4 GPU</strong> → Save</li>
+      <li>新建 cell，运行 <code>!nvidia-smi</code>，看到 T4 16GB 即成功</li>
+      <li>克隆本仓库（替换为你的 fork）：</li>
+    </ol>
+<pre><code class="language-bash">!git clone https://github.com/YOUR/ops.git
+%cd /content/ops
+!make -C code/ch01_intro ARCH=sm_75 run</code></pre>
+
+    <h3>方式 B · 本地 Linux + NVIDIA GPU</h3>
+<pre><code class="language-bash"># Ubuntu 22.04 为例
+sudo apt update
+sudo apt install -y nvidia-driver-535     # 重启后生效
+sudo apt install -y cuda-toolkit-12-4     # 包含 nvcc
+echo 'export PATH=/usr/local/cuda/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+
+# 验证
+nvcc --version
+nvidia-smi</code></pre>
+
+    <h3>方式 C · Docker（GPU 已可见）</h3>
+<pre><code class="language-bash">docker run --gpus all -it -v $PWD:/work \
+  nvcr.io/nvidia/cuda:12.4.1-devel-ubuntu22.04 bash
+# 容器内：cd /work && make -C code/ch01_intro run</code></pre>
+
+    <div class="callout warn">
+      <strong>⚠️ macOS / Apple Silicon：</strong>
+      Apple 在 2018 年后已停止支持 NVIDIA 显卡，本机无法跑 CUDA。
+      请用方式 A（Colab）或方式 C（远程 Linux + Docker）。
+      不过本仓库的 HTML 教程在任何系统上都能读，<code>code/common/cpu_ref.h</code> 里的 CPU 实现也能本机运行验证算子正确性。
+    </div>
+
+    <h2 id="device-query">1.3 第一个程序：deviceQuery</h2>
+    <p>每个学 CUDA 的人写的第一个程序，是<strong>问 GPU 自我介绍</strong>。源码：
+       <a href="../../code/ch01_intro/device_query.cu">code/ch01_intro/device_query.cu</a>。
+       关键 API 是 <code>cudaGetDeviceProperties()</code>，它把 GPU 的 100+ 项硬件参数填到一个 <code>cudaDeviceProp</code> 结构体里。</p>
+
+    <h3>核心代码</h3>
+<pre><code class="language-cpp">cudaDeviceProp p{};
+CUDA_CHECK(cudaGetDeviceProperties(&p, /*device=*/0));
+
+std::printf("GPU 0: %s\n", p.name);
+std::printf("  SM count           : %d\n", p.multiProcessorCount);
+std::printf("  Max threads / SM   : %d\n", p.maxThreadsPerMultiProcessor);
+std::printf("  Shared mem / block : %zu B\n", p.sharedMemPerBlock);
+std::printf("  Global memory      : %.2f GiB\n",
+            p.totalGlobalMem / double(1ull &lt;&lt; 30));
+
+// 实测带宽（DDR -> ×2）
+double bw = 2.0 * p.memoryClockRate * 1e3 * (p.memoryBusWidth / 8.0) / 1e9;
+std::printf("  Peak bandwidth     : %.1f GB/s\n", bw);</code></pre>
+
+    <h3>编译与运行</h3>
+<pre><code class="language-bash">cd code/ch01_intro
+make ARCH=sm_75    # T4
+./device_query</code></pre>
+
+    <h3>典型输出（T4）</h3>
+<pre><code>CUDA driver:  12.2
+CUDA runtime: 12.4
+Devices:      1
+
+============================================================
+GPU 0: Tesla T4
+  Compute capability : 7.5  (sm_75, Turing)
+  SM count           : 40
+  Max threads / block: 1024
+  Max threads / SM   : 1024  (= 32 warps)
+  Warp size          : 32
+  Registers / SM     : 65536 (32-bit)
+  Shared mem / block : 49152 B
+  Shared mem / SM    : 65536 B
+  Global memory      : 14.56 GiB
+  L2 cache           : 4096 KiB
+  Peak bandwidth     : 320.0 GB/s
+</code></pre>
+
+    <p>逐行解读这些数字：</p>
+    <ul>
+      <li><strong>SM count = 40</strong>：T4 上有 40 个独立的"小处理器"。你写的 kernel 会被切成块，分发到这 40 个 SM 上并行执行。</li>
+      <li><strong>Max threads / SM = 1024 = 32 warps</strong>：每个 SM 同时驻留最多 32 个 warp（每 warp 32 thread）。GPU 通过快速切换 warp 来"隐藏内存延迟"——这是性能的关键。</li>
+      <li><strong>Shared mem / block = 48 KB</strong>：每个 block 可用 48 KB 的片上 SRAM，速度比 global memory 快 ~100×。第 5-6 章会专门讲怎么用好它。</li>
+      <li><strong>Peak bandwidth = 320 GB/s</strong>：再快的 kernel 也跑不过这个带宽。后面用 Nsight 看 roofline 时这是横轴的"屋顶"。</li>
+    </ul>
+
+    <h2 id="bandwidth">1.4 第二个程序：内存带宽实测</h2>
+    <p>源码：<a href="../../code/ch01_intro/bandwidth_estimate.cu">bandwidth_estimate.cu</a>。
+       它做三组对照：
+       <strong>pageable H2D</strong>（普通 malloc 出来的主机内存 → 显存）、
+       <strong>pinned H2D</strong>（cudaMallocHost 的页锁定内存 → 显存）、
+       <strong>D2D</strong>（显存内拷贝）。</p>
+
+<pre><code class="language-cpp">// pinned (page-locked) host buffer：DMA 不需先复制到内核缓冲
+char* h_pinned = nullptr;
+CUDA_CHECK(cudaMallocHost(&amp;h_pinned, bytes));
+
+t.start();
+CUDA_CHECK(cudaMemcpy(d_buf, h_pinned, bytes, cudaMemcpyHostToDevice));
+t.stop();</code></pre>
+
+    <p>预期结果（T4，64MB payload）：</p>
+    <table>
+      <tr><th>transfer</th><th>带宽</th><th>说明</th></tr>
+      <tr><td>H2D pageable</td><td>~6 GB/s</td><td>受 PCIe 3.0 + 内核中转拖累</td></tr>
+      <tr><td>H2D pinned</td><td>~12 GB/s</td><td>接近 PCIe 3.0 x16 物理上限 16 GB/s</td></tr>
+      <tr><td>D2D</td><td>~250 GB/s</td><td>走 HBM，比 H2D 快 20–40 倍</td></tr>
+    </table>
+
+    <div class="callout">
+      <strong>💡 启示：</strong> 数据一旦上了显存就别再下来。
+      LLM 推理时，权重一次性 H2D 之后常驻显存；只有 prompt token id 和 logits 走 H2D/D2H，因为它们小到可以忽略带宽。
+    </div>
+
+    <h2>1.5 自检清单</h2>
+    <details>
+      <summary>Q1: 为什么不能用 CPU 跑 GPT-2？</summary>
+      <p>能跑，但慢得无法接受。GPT-2 small 一次前向需要 ~250M FLOPs × 模型层数，在 CPU 上单 token 生成需要几百毫秒；GPU 上 &lt; 10 毫秒。差距随模型规模扩大而加剧（GPT-4 在 CPU 上不可用）。</p>
+    </details>
+    <details>
+      <summary>Q2: T4 有 2560 个 CUDA core，是不是同时跑 2560 个线程？</summary>
+      <p>更微妙。T4 有 40 SM × 64 CUDA core = 2560 个 ALU 单元。但<strong>同时驻留</strong>的线程可以达到 40 × 1024 = 40960 个；硬件用快速 warp 切换来填满 ALU。这就是 GPU 隐藏延迟的核心机制。</p>
+    </details>
+    <details>
+      <summary>Q3: 为什么 pinned memory 比 pageable 快一倍？</summary>
+      <p>pageable 内存可能被 OS 换出。CUDA 需要先把它复制到一块内核拥有的 "staging buffer" 才能 DMA 给 GPU。pinned 内存被锁在物理内存中，DMA 直接读取，少一次拷贝。代价：pinned 占用宝贵的物理内存。</p>
+    </details>
+    <details>
+      <summary>Q4: <code>cudaGetDeviceProperties</code> 报告的 <code>memoryClockRate</code> 单位是什么？</summary>
+      <p>千赫兹 (kHz)。所以 5001000 表示 5.001 GHz。带宽公式 <code>2 × clock × bus_width / 8</code> 里要把 kHz × 1e3 转成 Hz。</p>
+    </details>
+    <details>
+      <summary>Q5: 我看到 <code>sharedMemPerBlock = 48 KB</code>，但 <code>sharedMemPerMultiprocessor = 64 KB</code>，差在哪？</summary>
+      <p>SM 上的 SRAM 总量是 64 KB（甚至 100 KB+ 在 A100 上），默认每个 block 最多用 48 KB；如果你显式开 dynamic shared memory 并调用 <code>cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, N)</code>，可以用到更多——但会限制 SM 上同时驻留的 block 数。</p>
+    </details>
+
+    <h2>1.6 练习</h2>
+    <ol>
+      <li><strong>cores per SM 表</strong>：参考 <code>code/ch01_intro/exercises/01_cores_per_sm_starter.cu</code>，补全函数 <code>cores_per_sm()</code>，让程序能打印 "总 CUDA core 数 = SM 数 × cores/SM"。<br>
+          答案见 <code>_solution.cu</code>。</li>
+      <li><strong>带宽测量</strong>：用不同 payload (<code>--MB=1, 4, 16, 64, 256</code>) 跑 <code>bandwidth_estimate</code>，画出 "payload vs 带宽" 曲线。你会发现小 payload 下带宽急剧下降——原因？（提示：固定延迟摊销到的字节数变少。）</li>
+      <li><strong>查阅</strong>：在 <a href="https://en.wikipedia.org/wiki/CUDA" target="_blank">CUDA 维基</a> 找出你 GPU 对应的 SM 架构发布年份和 Tensor Core 代际，记在自己的笔记里。</li>
+    </ol>
+
+    <h2 id="industry">1.7 工业实战：选 GPU、上多卡、看监控</h2>
+
+    <p>学到这里你能用一张 GPU 跑 hello world。生产环境还要回答四个问题：<strong>选哪张卡、怎么上多卡、跑起来怎么监控、用云还是自建</strong>。</p>
+
+    <h3>1.7.1 GPU 选型矩阵（2025 行情）</h3>
+
+    <p>NVIDIA 把 GPU 分两条产品线：<strong>数据中心卡</strong>（Tesla 系，被动散热、ECC、NVLink）和<strong>消费卡</strong>（GeForce 系，主动散热、无 NVLink、不允许商用数据中心部署）。</p>
+
+    <table>
+      <tr><th>卡</th><th>SM 架构</th><th>显存</th><th>HBM 带宽</th><th>fp16+TC 算力</th><th>定价（小时）</th><th>典型场景</th></tr>
+      <tr><td>T4</td><td>sm_75 Turing</td><td>16 GB</td><td>320 GB/s</td><td>65 TFLOPS</td><td>$0.35</td><td>Colab 免费 / 轻量推理</td></tr>
+      <tr><td>L4</td><td>sm_89 Ada</td><td>24 GB</td><td>300 GB/s</td><td>121 TFLOPS</td><td>$0.8</td><td>边缘推理 / 视频</td></tr>
+      <tr><td>L40S</td><td>sm_89 Ada</td><td>48 GB</td><td>864 GB/s</td><td>362 TFLOPS</td><td>$1.5</td><td>中等模型推理</td></tr>
+      <tr><td>A10</td><td>sm_86 Ampere</td><td>24 GB</td><td>600 GB/s</td><td>125 TFLOPS</td><td>$1.0</td><td>13B 推理</td></tr>
+      <tr><td>A100 40G / 80G</td><td>sm_80 Ampere</td><td>40/80 GB</td><td>1.5/2.0 TB/s</td><td>312 TFLOPS</td><td>$2-4</td><td>训练 / 70B 推理</td></tr>
+      <tr><td>H100 80G</td><td>sm_90 Hopper</td><td>80 GB</td><td>3.4 TB/s</td><td>989 TFLOPS (+ TMA)</td><td>$4-8</td><td>大模型训练 / 175B+ 推理</td></tr>
+      <tr><td>H200 141G</td><td>sm_90 Hopper</td><td>141 GB</td><td>4.8 TB/s</td><td>989 TFLOPS</td><td>$8-10</td><td>超大模型，显存敏感</td></tr>
+      <tr><td>B100 / B200</td><td>sm_100 Blackwell</td><td>192 GB</td><td>8 TB/s</td><td>~2200 TFLOPS</td><td>—</td><td>2025+ 最新</td></tr>
+      <tr><td>RTX 4090</td><td>sm_89 Ada</td><td>24 GB</td><td>1 TB/s</td><td>330 TFLOPS</td><td>$0.5（自建）</td><td>个人研究 / 不能商用 DC</td></tr>
+    </table>
+
+    <h3>决策口诀</h3>
+    <ul>
+      <li><strong>显存优先级 ≥ 算力</strong>：LLM 推理大多 memory-bound，显存装不下模型一切归零。70B fp16 ≈ 140 GB，最少 2×A100-80G 或 1×H200。</li>
+      <li><strong>带宽优先级 ≥ 算力</strong>：decode 阶段瓶颈是 HBM 带宽。H100 算力是 A100 的 3×，但 7B 模型 decode 也就快 2×（带宽差距 2.3×）。</li>
+      <li><strong>训练就上 H100/A100</strong>，消费卡禁不起多日满负载、NVLink 缺失导致多卡互联慢 5-10×。</li>
+      <li><strong>边缘推理用 L4/T4</strong>，功耗低、形态紧凑、TC 算力足够。</li>
+    </ul>
+
+    <h3>1.7.2 多 GPU 互联：NVLink vs PCIe vs IB</h3>
+
+    <p>训练大模型时多 GPU 间数据交换量巨大（每步几 GB），互联带宽直接决定吞吐。</p>
+
+    <table>
+      <tr><th>互联</th><th>带宽（双向）</th><th>延迟</th><th>典型场景</th></tr>
+      <tr><td>PCIe Gen4 x16</td><td>~64 GB/s</td><td>~1 μs</td><td>消费机、L4 服务器</td></tr>
+      <tr><td>PCIe Gen5 x16</td><td>~128 GB/s</td><td>~1 μs</td><td>H100 PCIe 版</td></tr>
+      <tr><td>NVLink 4 (H100 SXM)</td><td>900 GB/s</td><td>~200 ns</td><td>H100 8-GPU 服务器</td></tr>
+      <tr><td>NVLink 5 (B100/B200)</td><td>1.8 TB/s</td><td>~200 ns</td><td>2025+</td></tr>
+      <tr><td>InfiniBand HDR/NDR</td><td>200/400 Gb/s</td><td>~2 μs</td><td>多节点训练</td></tr>
+    </table>
+
+    <p><strong>判断你的卡有没有 NVLink</strong>：</p>
+<pre><code class="language-bash">nvidia-smi topo -m       # 看 GPU 之间的连接拓扑
+# 输出 NV4 / NV8 = NVLink (好); SYS / PHB = 走 PCIe (慢)</code></pre>
+
+    <p>多卡通信库永远走 <strong>NCCL</strong>（all-reduce / all-gather / reduce-scatter / broadcast 等集合通信）。<code>torch.distributed</code> 和 vLLM 的 tensor/pipeline parallel 都基于它。第 8 章的 stream 与第 14 章的扩展任务会用到。</p>
+
+    <h3>1.7.3 生产监控：nvidia-smi + DCGM</h3>
+
+    <p>跑生产任务必须监控 GPU 状态。常用命令：</p>
+
+<pre><code class="language-bash"># 实时刷新基本状态 (温度、功耗、显存、利用率)
+nvidia-smi -l 1
+
+# 进程级显存占用 + GPU 利用率
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+
+# 持续监控的工程化方案 (NVIDIA DCGM)
+dcgmi dmon -e 1001,1002,1003,203,150
+#  1001 = GR engine active   1002 = SM active   1003 = SM occupancy
+#   203 = mem util           150  = mem copy util
+
+# 拉到 Prometheus / Grafana
+docker run -d --gpus all -p 9400:9400 nvcr.io/nvidia/k8s/dcgm-exporter
+curl localhost:9400/metrics  # OpenMetrics 格式</code></pre>
+
+    <h3>看 nvidia-smi 时关注这 4 个指标</h3>
+    <ul>
+      <li><strong>GPU-Util</strong>：SM 在跑 kernel 的时间百分比。<strong>陷阱</strong>：100% 不代表算力跑满，它只表示"有 kernel 在跑"。一个 GEMV kernel 也能让 GPU-Util = 100% 但实际 5 TFLOPS。要看 Tensor Active% (Nsight)。</li>
+      <li><strong>Memory-Usage</strong>：显存占用。LLM 推理常见 90%+ 占用，正常；如果跟踪显示线性增长就是泄漏。</li>
+      <li><strong>Power</strong>：vs 卡上限 (TDP)。长期低于 60% TDP 说明在等数据（mem-bound）或在等 launch（小 kernel）。</li>
+      <li><strong>Temp</strong>：超过 85°C 会自动降频，性能掉 10-20%。机房空调或风扇问题。</li>
+    </ul>
+
+    <h3>1.7.4 云 vs 自建：成本现实</h3>
+
+    <table>
+      <tr><th>方案</th><th>$/H100-hour</th><th>启动时间</th><th>适合</th></tr>
+      <tr><td>AWS / GCP / Azure 大厂</td><td>$8-12</td><td>分钟</td><td>burst 训练、客户合规要求</td></tr>
+      <tr><td>Lambda / RunPod / CoreWeave</td><td>$2-5</td><td>分钟</td><td>个人研究、长跑训练</td></tr>
+      <tr><td>vast.ai / 二手算力市场</td><td>$1-3</td><td>分钟</td><td>实验、个人 LLM 调优</td></tr>
+      <tr><td>自建 (DIY 8×H100 服务器)</td><td>~$1（折旧 3 年）</td><td>无</td><td>持续 &gt; 50% 占用率才划算</td></tr>
+    </table>
+
+    <p><strong>简单算账</strong>：H100 服务器整机 ~$30 万，3 年折旧 + 电费 = ~$1.4/小时。如果 GPU 利用率 &lt; 30% 就比租云更贵。中小团队建议租云直到摸清需求量。</p>
+
+    <h3>1.7.5 环境陷阱 5 连发</h3>
+
+    <ol>
+      <li><strong>驱动版本 vs CUDA Toolkit 版本不匹配</strong>：每个 CUDA Toolkit 要求最低驱动版本。<code>nvcc --version</code> 是 Toolkit，<code>nvidia-smi</code> 顶部 "Driver Version: 535.xx / CUDA Version: 12.2" 是<strong>驱动支持的最高 CUDA</strong>，不是实际 Toolkit。混淆是新手第一大坑。</li>
+      <li><strong>CUDA_VISIBLE_DEVICES 改变物理 ID 顺序</strong>：默认按 PCI bus ID 排序，跟 <code>nvidia-smi</code> 顺序不一定相同。多卡训练时容易把同一张卡当作两张。设 <code>CUDA_DEVICE_ORDER=PCI_BUS_ID</code> 强制对齐。</li>
+      <li><strong>MIG (Multi-Instance GPU)</strong>：A100/H100 可以切成 7 个独立小 GPU 跑多租户，每片有独立 SM 和显存。但同一时刻只能选"全卡"或"分片"模式。误开 MIG 后程序看到的算力是 1/7，很多人调试半天没头绪。<code>nvidia-smi -mig 0</code> 关闭。</li>
+      <li><strong>容器里看到的 GPU 数 ≠ 物理数</strong>：docker 用 <code>--gpus '"device=0,1"'</code> 限制可见。K8s 用 <code>nvidia.com/gpu: 2</code> resource。两者都通过 NVIDIA Container Toolkit 实现 isolation。</li>
+      <li><strong>ECC 开启时显存少 ~6%</strong>：A100-80G 实际可用 ~76 GB（ECC 校验位占空间）。生产推理通常关 ECC 换更多显存：<code>nvidia-smi -e 0</code> 然后重启。代价：极小概率单 bit 翻转不被检测——不重要的推理可以接受，训练绝对不行。</li>
+    </ol>
+
+    <h2 id="frontier">1.8 研究前沿（2025-2026）</h2>
+
+    <h3>1.8.1 Blackwell 时代：B100 / B200 / GB200 NVL72</h3>
+
+    <p>2025 年开始 NVIDIA Blackwell 大规模出货，把"训练 / 推理大模型"的硬件单位从单卡升到<strong>整柜</strong>。</p>
+
+    <table>
+      <tr><th>形态</th><th>GPU 数</th><th>fp4 算力</th><th>HBM 总量</th><th>互联</th><th>典型场景</th></tr>
+      <tr><td>B100 (PCIe)</td><td>1</td><td>~7 PF</td><td>192 GB HBM3e</td><td>PCIe Gen5</td><td>tower 推理</td></tr>
+      <tr><td>B200 (SXM)</td><td>1</td><td>~10 PF</td><td>192 GB HBM3e</td><td>NVLink 5</td><td>训练 + 推理</td></tr>
+      <tr><td>GB200 Grace+Blackwell</td><td>1 GPU + 1 Grace CPU</td><td>10 PF</td><td>192 GB GPU + 480 GB LPDDR5X</td><td>NVLink-C2C</td><td>超大模型推理</td></tr>
+      <tr><td>GB200 NVL72</td><td>72 (= 36 GB200)</td><td>1.4 EF (fp4)</td><td>13.8 TB HBM</td><td>NVLink switch 全互联</td><td>千亿模型一柜推理</td></tr>
+      <tr><td>B300 (2025 末)</td><td>1</td><td>~15 PF</td><td>288 GB HBM3e</td><td>NVLink 5</td><td>推理优化版</td></tr>
+    </table>
+
+    <p><strong>关键概念变化</strong>：NVL72 把 72 张 GPU 通过 NVSwitch 全连成"一台逻辑 GPU"，<strong>跨卡带宽达 1.8 TB/s</strong>（接近单卡 HBM 带宽）。这让 TP=72 成为可能，1.8T 参数模型可以塞进一柜推理。</p>
+
+    <h3>1.8.2 FP4 / NVFP4 / MXFP4 — 推理新单位</h3>
+
+    <p>Blackwell 推理硬件原生支持 4-bit 浮点。NVIDIA 力推三种格式：</p>
+    <ul>
+      <li><strong>NVFP4 (E2M1)</strong>：1 sign + 2 exp + 1 mantissa，配 per-block fp8 scale (block=16)。NVIDIA 优选格式，推理精度损失 &lt; 1%</li>
+      <li><strong>MXFP4 (E2M1)</strong>：开放标准 (OCP MX)，配 E8M0 scale (block=32)。精度略差但跨厂商通用</li>
+      <li><strong>MXFP6 (E3M2 / E2M3)</strong>：6-bit 中间档，激活用</li>
+    </ul>
+
+    <p>性能跳跃：fp16 → fp8 → fp4 每步算力翻倍。B200 上 LLM 推理吞吐相比 H100 fp8 再增 2-3 倍。</p>
+
+    <h3>1.8.3 模型规模与新范式（2024-2026）</h3>
+
+    <table>
+      <tr><th>模型</th><th>规模</th><th>关键创新</th><th>发布</th></tr>
+      <tr><td>Llama 3.1 405B</td><td>405B dense</td><td>开源 SOTA dense，长 context 128K</td><td>2024.07</td></tr>
+      <tr><td>DeepSeek-V3</td><td>671B MoE (37B 激活)</td><td>原生 FP8 训练 + MLA + DeepSeekMoE + MTP</td><td>2024.12</td></tr>
+      <tr><td>DeepSeek-R1</td><td>671B (同 V3)</td><td>纯 RL reasoning, o1-级性能开源</td><td>2025.01</td></tr>
+      <tr><td>Llama 4 Behemoth / Maverick</td><td>2T / 400B MoE</td><td>多模态原生, 10M context</td><td>2025</td></tr>
+      <tr><td>Qwen 3 系列</td><td>~32B / 235B MoE</td><td>中文 SOTA, 思考链开源</td><td>2025</td></tr>
+      <tr><td>OpenAI o1 / o3 / GPT-5</td><td>未知</td><td>test-time compute, 大量 token 推理</td><td>2024-2025</td></tr>
+      <tr><td>Anthropic Claude 3.5/4</td><td>未知</td><td>computer use, agentic</td><td>2024-2025</td></tr>
+      <tr><td>Gemini 2.0/2.5 Pro</td><td>未知</td><td>原生 multimodal + 2M context</td><td>2024-2025</td></tr>
+    </table>
+
+    <p><strong>三个大趋势对硬件需求的影响</strong>：</p>
+    <ol>
+      <li><strong>MoE 主导</strong>（DeepSeek-V3、Llama 4、Qwen 3）：参数量 10×，激活 1/3-1/10 → 需要<strong>显存大 + Expert Parallelism</strong>。NVL72 完美匹配</li>
+      <li><strong>长 context (1M-10M)</strong>：KV cache 显存爆炸 → 必须 PagedAttention + KV 量化 + 长 context attention 优化 (Ring/Stripe)</li>
+      <li><strong>Reasoning models（o1 / R1 风格）</strong>：单个回答可能生成 10-100K 个 thinking token → 推理服务的 <strong>decode 吞吐</strong>变得比 prefill 还关键</li>
+    </ol>
+
+    <h3>1.8.4 推理硬件性价比新格局（2026）</h3>
+
+    <table>
+      <tr><th>硬件</th><th>定价 / 小时</th><th>fp8 / fp4 算力</th><th>适合</th></tr>
+      <tr><td>RTX 5090 (Blackwell 消费级)</td><td>~$0.7 (DIY)</td><td>~3 PF fp4</td><td>本地 70B 推理</td></tr>
+      <tr><td>L40S (旧 Ada)</td><td>~$1.5</td><td>362 TF fp16</td><td>13B 边缘服务</td></tr>
+      <tr><td>H200 (Hopper)</td><td>~$3-5</td><td>989 TF fp16</td><td>2024 主流</td></tr>
+      <tr><td>B200 (Blackwell)</td><td>~$6-10</td><td>10 PF fp4</td><td>2025-26 主流</td></tr>
+      <tr><td>GB200 NVL72 (整柜)</td><td>~$300+/小时</td><td>1.4 EF</td><td>训练大模型 / 千亿推理</td></tr>
+      <tr><td>AMD MI300X / MI325X</td><td>~$3-5</td><td>1.3 PF fp16</td><td>显存 192-256 GB，长 context 友好</td></tr>
+      <tr><td>Google TPU v5p / v6 Trillium</td><td>云独占</td><td>~459 TF bf16</td><td>Google 内部 + GCP</td></tr>
+    </table>
+
+    <p>2026 现实：<strong>AMD 和 TPU 真正成为 NVIDIA 的竞争对手</strong>（之前只是替代）。Meta、Microsoft、Google 都在大规模部署非 NVIDIA 推理硬件，主要因为 NVIDIA 供货紧 + 单价高。但 CUDA 生态仍是不可替代的研发起点。</p>
+
+    <h3>1.8.5 学习建议（2026 视角）</h3>
+
+    <ul>
+      <li><strong>仍然先学 CUDA</strong>，因为 ROCm/MLIR/TPU 接口都是它的"方言"</li>
+      <li>用 H100 或 H200 入门生产级实战；条件允许直接上 B200</li>
+      <li>FlashAttention v3 / FlashMLA / ThunderKittens 是 2025 后的必读源码</li>
+      <li>DeepSeek-V3 技术报告对理解"原生 FP8 训练 + MoE + MLA + 长 context"四合一极有价值</li>
+      <li>关注 Triton / CUTLASS 3.x CuTe DSL — 未来 5 年的 kernel 开发语言</li>
+    </ul>
+
+    <h2>1.9 常见坑</h2>
+    <ul>
+      <li><code>nvcc: command not found</code> → CUDA Toolkit 没装或没加 PATH。<code>export PATH=/usr/local/cuda/bin:$PATH</code>。</li>
+      <li><code>CUDA driver version is insufficient for CUDA runtime version</code> → 驱动太旧，升级 NVIDIA 驱动到 R535+。</li>
+      <li>Colab 跑出来发现没 GPU → 大概率是没切到 GPU runtime，重新 Runtime → Change runtime type。</li>
+      <li>编译报错 <code>unsupported gpu architecture 'compute_xx'</code> → ARCH 参数写错了，按你的 GPU 改 (T4 → sm_75, A100 → sm_80, 4090 → sm_89)。</li>
+    </ul>
+
+    <h2>下一步</h2>
+    <p>环境就绪后，第 2 章我们写真正的第一个 kernel，理解 <code>&lt;&lt;&lt;grid, block&gt;&gt;&gt;</code> 这个看起来很怪的语法到底在干什么。</p>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../index.html">
+        <span class="label">返回首页</span>
+        🏠 学习路径
+      </a>
+      <a class="next" href="../ch02-hello/index.html">
+        <span class="label">下一章</span>
+        02 · Hello CUDA →
+      </a>
+    </nav>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body>
+</html>

@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 10 章 · Softmax 与 Norm</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head><body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol><li><a href="../ch01-intro/index.html">导论与环境</a></li><li><a href="../ch02-hello/index.html">Hello CUDA</a></li><li><a href="../ch03-threads/index.html">线程模型与索引</a></li><li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li></ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5"><li><a href="../ch05-memory/index.html">内存层级</a></li><li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li><li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li><li><a href="../ch08-async/index.html">性能分析与异步</a></li></ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9"><li><a href="../ch09-gemm/index.html">GEMM 深入</a></li><li><a href="../ch10-softmax/index.html" class="current">Softmax & Norm</a></li><li><a href="../ch11-attention/index.html">Attention 入门</a></li><li><a href="../ch12-flashattn/index.html">FlashAttention</a></li><li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li><li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li></ol>
+      <div class="stage">附录</div><ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 10 章 · Softmax 与 Norm</h1>
+    <div class="chapter-meta"><span>⏱️ 60 分钟</span><span>🎯 写出 online softmax</span><span>📂 code/ch10_softmax/</span></div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>写出<strong>数值稳定</strong>的 softmax（必减 max）</li>
+      <li>掌握 <span class="term" data-en="online softmax">在线 softmax</span>：合并 (max, sum) 的更新法则——FlashAttention 的核心</li>
+      <li>写出 RMSNorm（Llama / GPT-NeoX 使用，比 LayerNorm 少一次求均值）</li>
+    </ul>
+
+    <h2 id="stable">10.1 数值稳定的 Softmax</h2>
+    <p>数学定义：</p>
+<pre><code>softmax(x_i) = exp(x_i) / sum_j exp(x_j)</code></pre>
+    <p>直接实现的死法：<code>exp(50)</code> 已经 ≈ 5×10²¹，<code>exp(100)</code> 已经溢出 fp32 上限 ≈ 3.4×10³⁸。
+       LLM 训练 / 推理中 attention logits 经常上百，溢出后变 inf/nan，整个层崩。</p>
+
+    <p>救法：<strong>减去 max</strong>（不影响结果，因为分子分母同除一个常数）：</p>
+<pre><code>m = max(x)
+softmax(x_i) = exp(x_i - m) / sum_j exp(x_j - m)</code></pre>
+    <p>现在 <code>x_i - m ≤ 0</code>，<code>exp(...) ∈ (0, 1]</code>，永远不溢出。</p>
+
+    <h3>三阶段实现</h3>
+<pre><code class="language-cpp">// 每 row 一个 block, BLOCK threads/row
+__global__ void softmax_row(const float* x, float* y, int rows, int cols) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* xr = x + row * cols;
+    float* yr       = y + row * cols;
+
+    // ---- 1) max ----
+    float local_max = -FLT_MAX;
+    for (int c = tid; c &lt; cols; c += BLOCK)
+        local_max = fmaxf(local_max, xr[c]);
+    local_max = block_reduce_max(local_max);     // warp shuffle, 见 Ch7
+    float row_max = ...;
+
+    // ---- 2) sum ----
+    float local_sum = 0.f;
+    for (int c = tid; c &lt; cols; c += BLOCK)
+        local_sum += __expf(xr[c] - row_max);
+    float row_sum = block_reduce_sum(local_sum);
+    float inv = 1.f / row_sum;
+
+    // ---- 3) write ----
+    for (int c = tid; c &lt; cols; c += BLOCK)
+        yr[c] = __expf(xr[c] - row_max) * inv;
+}</code></pre>
+
+    <p><code>__expf</code> 是 CUDA intrinsic，比 <code>expf</code> 略快但精度低一点；attention 里完全够用。</p>
+
+    <h2 id="online">10.2 Online Softmax — 一遍扫完</h2>
+    <p>上面方法要扫数据<strong>三次</strong>（max → exp+sum → write）。每次扫都消耗 HBM 带宽，softmax 长度大时性能不佳。</p>
+
+    <p>聪明算法：维护一个 running pair <code>(m, l)</code>，<code>m</code> 是目前最大值、<code>l</code> 是 <code>sum exp(x_i - m)</code>。
+       新看到 <code>(x_new, 1)</code>（视为有 1 个值的小 group）时：</p>
+
+<pre><code>m_new = max(m, x_new)
+l_new = l * exp(m - m_new) + 1 * exp(x_new - m_new)
+m, l = m_new, l_new</code></pre>
+
+    <p>结果：<strong>一遍扫数据就同时算出 max 和 sum</strong>。把这个 merge 嵌进 warp shuffle，一次 block reduce 搞定。</p>
+
+<pre><code class="language-cpp">__device__ void merge(float&amp; m, float&amp; l, float xm, float xl) {
+    float new_m = fmaxf(m, xm);
+    l = l * __expf(m - new_m) + xl * __expf(xm - new_m);
+    m = new_m;
+}
+
+// warp 内合并
+for (int o = 16; o &gt; 0; o &gt;&gt;= 1) {
+    float om = __shfl_xor_sync(0xffffffff, m, o);
+    float ol = __shfl_xor_sync(0xffffffff, l, o);
+    merge(m, l, om, ol);
+}</code></pre>
+
+    <div class="callout">
+      <strong>🔥 为什么这是 FlashAttention 的基石？</strong>
+      Attention 的 softmax 维度 = 序列长度 T，可能成千上万。如果你把整个 T×T attention matrix 物化到 HBM 再做 softmax → O(T²) 显存 + 三次扫描。
+      online softmax 让你<strong>一边算 QKᵀ 一边算 softmax 一边乘 V</strong>，全程数据驻留在 shared/register，省 O(T²) HBM 流量。第 12 章详细推导。
+    </div>
+
+    <h2 id="rmsnorm">10.3 LayerNorm 与 RMSNorm</h2>
+    <table>
+      <tr><th></th><th>LayerNorm</th><th>RMSNorm</th></tr>
+      <tr><td>公式</td><td>y = (x - μ) / σ · γ + β</td><td>y = x / RMS(x) · γ</td></tr>
+      <tr><td>需要</td><td>mean μ, var σ²</td><td>仅 mean(x²)</td></tr>
+      <tr><td>参数</td><td>γ, β</td><td>仅 γ</td></tr>
+      <tr><td>计算</td><td>2 次 reduce</td><td>1 次 reduce</td></tr>
+      <tr><td>用户</td><td>GPT-2, BERT</td><td>Llama, GPT-NeoX, Mistral</td></tr>
+    </table>
+
+    <p>RMSNorm 实现（每 row 一个 block）：</p>
+<pre><code class="language-cpp">__global__ void rmsnorm_row(const float* x, const float* gamma, float* y,
+                            int rows, int cols, float eps) {
+    int row = blockIdx.x, tid = threadIdx.x;
+    const float* xr = x + row * cols;
+    float* yr       = y + row * cols;
+
+    float local_sq = 0.f;
+    for (int c = tid; c &lt; cols; c += BLOCK) {
+        float v = xr[c]; local_sq += v * v;
+    }
+    float sq = block_reduce_sum(local_sq);
+    float inv = rsqrtf(sq / cols + eps);          // <-- rsqrt 单指令
+    for (int c = tid; c &lt; cols; c += BLOCK)
+        yr[c] = xr[c] * inv * gamma[c];
+}</code></pre>
+
+    <p><code>rsqrtf</code>（reciprocal sqrt）是单条 SFU 指令，比 <code>1.f / sqrtf(x)</code> 快很多。</p>
+
+    <h2>10.4 自检</h2>
+    <details><summary>Q1: 为什么 softmax 减 max 不影响数学结果？</summary><p><code>exp(x - c) / sum exp(x - c) = e^{-c} * exp(x) / (e^{-c} * sum exp(x)) = exp(x) / sum exp(x)</code>，常数因子抵消。</p></details>
+    <details><summary>Q2: online softmax 的合并公式怎么推？</summary><p>展开：<code>sum_old exp(x_i - m_old) * exp(m_old - m_new) = sum_old exp(x_i - m_new)</code>。所以 <code>l_new = l_old * exp(m_old - m_new) + new_part</code>。</p></details>
+    <details><summary>Q3: LayerNorm 跟 BatchNorm 的差别？</summary><p>LN 沿 feature 维度归一（与 batch 无关），BN 沿 batch 维度归一。LLM 推理 batch=1 时 BN 无法工作，所以 Transformer 一律用 LN/RMSNorm。</p></details>
+    <details><summary>Q4: RMSNorm 比 LayerNorm 真的更好吗？</summary><p>不一定"更好"，但<strong>更便宜</strong>（少一次 reduce, 少一个参数 β），且效果与 LayerNorm 接近。这就是 Llama 系列的选择。</p></details>
+    <details><summary>Q5: 大 cols (D=8192) 时怎么办？</summary><p>每 row 一个 block 时 D=8192 → 32 thread / 32 elem each. 用 vectorized load (<code>float4</code>) 提带宽; 或者拆 row 用多 block + atomicAdd。</p></details>
+
+    <h2>10.5 练习</h2>
+    <ol>
+      <li>把 <code>softmax.cu</code> 改成 fp16 输入 fp32 累加，对比 fp32 输入版的精度（typical max_abs ~1e-3）。</li>
+      <li>把 <code>online_softmax</code> 扩成<strong>支持 cols &gt; 1024</strong>：每 thread 处理多个 element，再 warp 合并。</li>
+      <li>写一个 <strong>LayerNorm</strong> kernel（多一次 mean reduce），与 cpu_ref::layernorm 对拍。</li>
+      <li>用 <code>float4</code> vector load 重写 rmsnorm，看带宽是否提升 30%+。</li>
+    </ol>
+
+    <h2 id="industry">10.6 工业实战：Welford、融合 norm+GEMM、fp16 数值与对齐</h2>
+
+    <h3>10.6.1 Welford 算法 — 数值稳定的 variance</h3>
+
+    <p>LayerNorm 的"经典两遍"：先算 mean，再算 var。问题：D 很大（4096+）时，第二遍累加 (x-mean)² 仍可能丢精度。</p>
+
+    <p>Welford 算法<strong>单遍</strong>同时算 mean 和 var 且数值更稳：</p>
+
+<pre><code class="language-cpp">// Welford running update
+__device__ void welford_update(int&amp; n, float&amp; mean, float&amp; m2, float x) {
+    n += 1;
+    float delta  = x - mean;
+    mean        += delta / n;
+    float delta2 = x - mean;
+    m2          += delta * delta2;
+}
+
+// Welford merge (两个 partial 合并, warp/block reduce 用得到)
+__device__ void welford_merge(int&amp; nA, float&amp; meanA, float&amp; m2A,
+                              int  nB, float  meanB, float  m2B) {
+    int n = nA + nB;
+    float delta = meanB - meanA;
+    meanA = (nA * meanA + nB * meanB) / n;
+    m2A  += m2B + delta * delta * (float(nA) * nB / n);
+    nA = n;
+}
+
+// 最终 variance = m2 / n</code></pre>
+
+    <p>warp 内合并用 <code>__shfl_xor_sync</code> 同时交换 (n, mean, m2) 三个 reg。生产 LayerNorm 内核（PyTorch ATen、Apex）都用 Welford。</p>
+
+    <h3>10.6.2 融合 LayerNorm + QKV projection</h3>
+
+    <p>朴素流程：</p>
+<pre><code>1) LayerNorm(X) → normed     [写 HBM]
+2) QKV = normed @ W_qkv      [读 HBM]
+3) split → Q, K, V            [写 HBM]</code></pre>
+
+    <p>HBM 流量 ≈ 6 × (T·D) 字节，对 memory-bound 的小 batch decode 是浪费。</p>
+
+    <p>融合做法（TRT-LLM、Apex 都有实现）：把 LayerNorm 嵌入 QKV GEMM 的 <strong>load</strong> 阶段——每加载 X 的一行就<strong>实时归一化</strong>，归一化后的值直接喂给 GEMM 的内积。</p>
+
+<pre><code class="language-cpp">// 伪代码: fused LN-QKV kernel
+__global__ void fused_ln_qkv(const __half* X, const __half* W_qkv,
+                              const __half* gamma, const __half* beta,
+                              __half* QKV, int T, int D, int D3) {
+    int t = blockIdx.x;                      // row of X
+    __shared__ float row_mean, row_inv_std;
+
+    // 1) 算这一行的 mean/var (Welford block-reduce)
+    welford_block_reduce(X + t*D, D, &amp;row_mean, &amp;row_inv_std);
+
+    // 2) GEMM: 算 QKV[t, :] = norm(X[t,:]) @ W_qkv
+    for (int out = threadIdx.x; out &lt; D3; out += blockDim.x) {
+        float acc = 0;
+        for (int d = 0; d &lt; D; ++d) {
+            float xn = (__half2float(X[t*D+d]) - row_mean) * row_inv_std
+                     * __half2float(gamma[d]) + __half2float(beta[d]);
+            acc += xn * __half2float(W_qkv[d*D3 + out]);
+        }
+        QKV[t*D3 + out] = __float2half(acc);
+    }
+}</code></pre>
+
+    <p>实测加速：对 decode (M=1) 阶段提升 30-50%；prefill (M 大) 因为 GEMM 已经是瓶颈，融合收益小。</p>
+
+    <h3>10.6.3 fp16 softmax 的数值技巧</h3>
+
+    <p>fp16 上限 65504，attention logits 容易爆。生产做法：<strong>累加器必 fp32</strong>，<strong>I/O 用 fp16/bf16</strong>。</p>
+
+<pre><code class="language-cpp">// fp16 输入, fp32 累加
+__global__ void softmax_fp16(const __half* x, __half* y, int rows, int cols) {
+    extern __shared__ float sm[];
+    int row = blockIdx.x, tid = threadIdx.x;
+    const __half* xr = x + row * cols;
+
+    // 1) row max in fp32
+    float m = -FLT_MAX;
+    for (int c = tid; c &lt; cols; c += blockDim.x)
+        m = fmaxf(m, __half2float(xr[c]));
+    m = block_reduce_max(m);
+    // 2) row sum in fp32
+    float s = 0;
+    for (int c = tid; c &lt; cols; c += blockDim.x)
+        s += __expf(__half2float(xr[c]) - m);
+    s = block_reduce_sum(s);
+    float inv = 1.f / s;
+    // 3) write fp16
+    for (int c = tid; c &lt; cols; c += blockDim.x) {
+        float v = __expf(__half2float(xr[c]) - m) * inv;
+        y[row * cols + c] = __float2half(v);
+    }
+}</code></pre>
+
+    <p><strong>bf16 时甚至不用减 max</strong>（动态范围 ±10³⁸ 跟 fp32 一样），但减 max 是免费的稳定保险，<strong>仍然要做</strong>。</p>
+
+    <h3>10.6.4 向量化 + 对齐：减半的 HBM 流量</h3>
+
+    <p>softmax / norm 是 memory-bound（每个元素 O(1) FLOP）。把 fp16 用 <code>__half2</code> 一次读两个：</p>
+
+<pre><code class="language-cpp">// 慢: 一次一个 fp16
+for (int c = tid; c &lt; cols; c += BLOCK)
+    sum += __half2float(x[c]);
+
+// 快: 一次 __half2 (相当于 fp16x2, 一条指令)
+const __half2* x2 = reinterpret_cast&lt;const __half2*&gt;(x);
+for (int c = tid; c &lt; cols / 2; c += BLOCK) {
+    __half2 v = x2[c];
+    sum += __half2float(__low2half(v)) + __half2float(__high2half(v));
+}</code></pre>
+
+    <p>用 <code>uint4</code> (= 8 fp16) 一次搬 16 字节，吞吐再 +30%。生产 norm kernel <strong>必</strong>向量化。</p>
+
+    <h3>10.6.5 RMSNorm 与 GeLU 的 fp16 融合</h3>
+
+    <p>Llama / Mistral 的 FFN 大量出现：</p>
+<pre><code>y = silu(x @ W_gate) ⊙ (x @ W_up)        // SwiGLU
+y_norm = RMSNorm(y + residual)             // 下一层 norm</code></pre>
+
+    <p>生产 kernel 把这一连串 <strong>silu + element-wise mul + add residual + RMSNorm</strong> 融合成 1 个 kernel，把 4 次 HBM 来回压缩成 1 次。TensorRT-LLM 的 fused MLP 就是这样。</p>
+
+    <h3>10.6.6 各 norm 的工业选择</h3>
+    <table>
+      <tr><th>Norm</th><th>用户</th><th>需要的 reduce</th><th>参数</th></tr>
+      <tr><td>LayerNorm</td><td>GPT-2/3/4, BERT</td><td>mean + var (Welford)</td><td>γ, β</td></tr>
+      <tr><td>RMSNorm</td><td>Llama, Mistral, Qwen, GPT-NeoX</td><td>只要 mean(x²)</td><td>仅 γ</td></tr>
+      <tr><td>GroupNorm</td><td>CV (Stable Diffusion U-Net)</td><td>按 group 分别 mean/var</td><td>γ, β</td></tr>
+      <tr><td>BatchNorm</td><td>CV CNN 训练</td><td>跨 batch 维 mean/var</td><td>γ, β, running stats</td></tr>
+    </table>
+    <p>LLM 推理基本只见 LayerNorm 和 RMSNorm。后者实现简单 30%，是新模型默认选项。</p>
+
+    <h2 id="frontier">10.7 研究前沿（2025-2026）：QK Norm、FP8 Softmax、超大融合</h2>
+
+    <h3>10.7.1 QK Norm — 训练稳定性新标配</h3>
+
+    <p>2024-2025 几乎所有新模型（DeepSeek-V3、Qwen 3、Llama 4、Gemma 2）都加了 <strong>QK Norm</strong>：在算 QK^T 前对 Q 和 K 各做一次 RMSNorm。</p>
+
+<pre><code class="language-cpp">// 标准:    S = (Q @ K^T) / sqrt(D)
+// QK-Normed: Q' = RMSNorm(Q, gamma_q)
+//            K' = RMSNorm(K, gamma_k)
+//            S  = Q' @ K'^T  *  scale</code></pre>
+
+    <p>动机：fp8 训练中 logits outlier 让 softmax 输入超 fp8 范围。QK Norm 标准化后 attention logit 分布更稳，<strong>是 fp8 训练能跑稳的关键之一</strong>。</p>
+
+    <h3>10.7.2 FP8 / FP4 Softmax 的数值铁律</h3>
+
+    <table>
+      <tr><th>张量</th><th>fp16</th><th>fp8 推理</th><th>fp4 推理</th></tr>
+      <tr><td>logits 输入</td><td>fp16</td><td>fp8 E4M3</td><td>fp8 E4M3 (不是 fp4!)</td></tr>
+      <tr><td>row_max</td><td>fp32</td><td>fp32</td><td>fp32</td></tr>
+      <tr><td>exp(x - max)</td><td>fp32</td><td>fp32</td><td>fp32</td></tr>
+      <tr><td>row_sum</td><td>fp32</td><td>fp32</td><td>fp32</td></tr>
+      <tr><td>P (概率)</td><td>fp16</td><td>fp8 E4M3</td><td>fp8 E4M3</td></tr>
+    </table>
+
+    <p><strong>铁律</strong>：softmax 内部 reduce 永远 fp32，无论输入输出多低精度。fp4 时连 attention 的 P 都最好用 fp8 而非 fp4（避免 PV 阶段精度爆崩）。</p>
+
+    <h3>10.7.3 Norm 选型（2026）</h3>
+
+    <table>
+      <tr><th>Norm</th><th>2024-2026 使用情况</th></tr>
+      <tr><td>LayerNorm</td><td>GPT-2/3/4 老模型；新模型已弃用</td></tr>
+      <tr><td>RMSNorm</td><td>Llama 2/3/4, Mistral, Qwen, DeepSeek — <strong>事实标准</strong></td></tr>
+      <tr><td>RMSNorm + QK Norm</td><td>DeepSeek-V3, Qwen 3, Gemma 2 — 2024-26 SOTA</td></tr>
+      <tr><td>Z-Loss</td><td>PaLM 起源, 训练辅助 loss, 让 logsumexp 接近 0, fp8 训练有用</td></tr>
+      <tr><td>Pre-Norm vs Post-Norm</td><td>新模型 Pre-Norm 主流, 但 DeepNet 等 Post-Norm 改良有人在用</td></tr>
+    </table>
+
+    <h3>10.7.4 fused-everything：Norm + Activation + Residual + Quant 一坨</h3>
+
+    <p>2024-2026 生产 kernel 越来越往"超大融合"走。真实的 SwiGLU + RMSNorm + residual + fp8 量化 kernel：</p>
+
+<pre><code class="language-cpp">__global__ void fused_swiglu_rmsnorm_quant(
+    const __half* gate, const __half* up, const __half* residual,
+    const __half* gamma, float* scale_out, __nv_fp8_e4m3* out, int T, int D) {
+    int t = blockIdx.x, tid = threadIdx.x;
+    float acc[D / BLOCK];
+    // 1) SiLU(gate) * up + residual, 留寄存器
+    for (int d = tid, i = 0; d &lt; D; d += BLOCK, ++i) {
+        float g = __half2float(gate[t*D+d]);
+        float u = __half2float(up[t*D+d]);
+        float r = __half2float(residual[t*D+d]);
+        acc[i] = g / (1 + __expf(-g)) * u + r;
+    }
+    // 2) RMSNorm: mean(x²) reduce
+    float sq = 0;
+    for (int i = 0; i &lt; D/BLOCK; ++i) sq += acc[i] * acc[i];
+    sq = block_reduce_sum(sq);
+    float inv_rms = rsqrtf(sq / D + 1e-5f);
+    // 3) Norm * gamma + 量化到 fp8 (per-row scale)
+    float row_amax = 0;
+    for (int d = tid, i = 0; d &lt; D; d += BLOCK, ++i) {
+        float v = acc[i] * inv_rms * __half2float(gamma[d]);
+        row_amax = fmaxf(row_amax, fabsf(v));
+        acc[i] = v;
+    }
+    row_amax = block_reduce_max(row_amax);
+    float scale = row_amax / 448.f;          // E4M3 max
+    if (tid == 0) scale_out[t] = scale;
+    for (int d = tid, i = 0; d &lt; D; d += BLOCK, ++i)
+        out[t*D+d] = __nv_fp8_e4m3(acc[i] / scale);
+}</code></pre>
+
+    <p>这一个 kernel 替代了 5 个独立 kernel + 4 次 HBM 来回。<strong>LLM decode 减少 30-50% 显存流量</strong>。TensorRT-LLM 的 fused MLP 全这么写。</p>
+
+    <h3>10.7.5 Online softmax 的扩展应用（2024-2025）</h3>
+
+    <ul>
+      <li><strong>Chunked Prefill</strong>（vLLM 2024）：prompt 分多块处理，跨块用 online softmax merge</li>
+      <li><strong>Prefix Caching + Online Softmax</strong>（SGLang）：命中 prefix 的 (m, l) 跟新 token 的合并</li>
+      <li><strong>Speculative 验证</strong>：多候选 token 概率分布在线 reduce</li>
+      <li><strong>Mamba 状态更新</strong>：借鉴 online 累加思路</li>
+    </ul>
+
+    <h3>10.7.6 训练侧新 loss 对 softmax 的影响</h3>
+
+    <ul>
+      <li><strong>DPO/IPO/KTO</strong>：偏好对齐，算 <code>log_prob_diff = log(p_chosen / p_rejected)</code>，<strong>softmax 后再 reduce</strong></li>
+      <li><strong>GRPO</strong>（DeepSeek-R1, 2025）：强化学习 reasoning，多采样 reward → softmax + relative reward reduce</li>
+      <li><strong>Z-Loss</strong>：辅助 loss 让 logsumexp 接近 0，fp8 训练标配</li>
+    </ul>
+
+    <h2>10.8 常见坑</h2>
+    <ul>
+      <li>忘记减 max → 长 attention logits 直接 inf，模型输出全 nan</li>
+      <li>online softmax 的 <code>exp(m - m_new)</code> 当 m=-FLT_MAX 时报 -inf - 大数 = -inf，<code>exp(-inf) = 0</code>，正常；但初始值要小心设</li>
+      <li>RMSNorm 算 mean(x²) 时直接 fp16 累加 → 损失精度，必须 fp32</li>
+      <li>fp4 推理把 P 也存 fp4 → PV 阶段精度暴跌，必须 P 保持 fp8</li>
+      <li>QK Norm 漏掉 K 或 Q 任一边 → 训练 loss 看着没事但下游评测掉点</li>
+      <li>fused kernel 一旦写错某一步，整个 kernel 失败但 stack trace 没用 — debug 把 fused 拆回独立 kernel 二分定位</li>
+    </ul>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch09-gemm/index.html"><span class="label">上一章</span>← 09 · GEMM</a>
+      <a class="next" href="../ch11-attention/index.html"><span class="label">下一章</span>11 · Attention 入门 →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body></html>

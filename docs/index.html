@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA × LLM 推理 实战教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">导航</div>
+      <ol style="counter-reset: ch -1">
+        <li style="list-style:none"><a href="index.html" class="current">🏠 首页</a></li>
+        <li style="list-style:none"><a href="glossary.html">📖 术语表</a></li>
+      </ol>
+      <div class="stage">A · 基础</div>
+      <ol>
+        <li><a href="ch01-intro/index.html">导论与环境</a></li>
+        <li><a href="ch02-hello/index.html">Hello CUDA</a></li>
+        <li><a href="ch03-threads/index.html">线程模型与索引</a></li>
+        <li><a href="ch04-arch/index.html">GPU 硬件架构</a></li>
+      </ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5">
+        <li><a href="ch05-memory/index.html">内存层级</a></li>
+        <li><a href="ch06-tile/index.html">Shared Memory & Tile</a></li>
+        <li><a href="ch07-reduce/index.html">Reduction & Scan</a></li>
+        <li><a href="ch08-async/index.html">性能分析与异步</a></li>
+      </ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9">
+        <li><a href="ch09-gemm/index.html">GEMM 深入</a></li>
+        <li><a href="ch10-softmax/index.html">Softmax & Norm</a></li>
+        <li><a href="ch11-attention/index.html">Attention 入门</a></li>
+        <li><a href="ch12-flashattn/index.html">FlashAttention</a></li>
+        <li><a href="ch13-llm-parts/index.html">LLM 必备零件</a></li>
+        <li><a href="ch14-mini-llm/index.html">Capstone Mini-LLM</a></li>
+      </ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>CUDA × LLM 推理 实战教程</h1>
+    <div class="chapter-meta">
+      <span>📚 14 章</span>
+      <span>💻 60+ 个示例</span>
+      <span>🐍 中文 · CUDA C++</span>
+      <span>🎯 目标：手写 GPT-2 推理</span>
+    </div>
+
+    <p>
+      这是一份从零起步的 CUDA GPU 编程教程，目的不是让你"用 PyTorch 调几行就跑通模型"，
+      而是让你<strong>真正理解大模型推理是怎么在硬件上跑起来的</strong>，
+      最终亲手写出一个能跑 GPT-2 small 的推理引擎。
+    </p>
+
+    <div class="callout">
+      <strong>📍 学习准备：</strong> 你需要会基础 C/C++，不需要任何并行编程经验；
+      不需要在本机装 CUDA Toolkit，<a href="ch01-intro/index.html#colab">用 Google Colab 即可一键运行</a>。
+    </div>
+
+    <h2>学习路径</h2>
+    <p>三大阶段、十四章、强依赖（建议顺序学）：</p>
+
+    <div class="stage-banner">阶段 A · 基础（学会写 kernel）</div>
+    <div class="roadmap">
+      <a class="card wip" href="ch01-intro/index.html">
+        <div class="num">CHAPTER 01</div>
+        <div class="title">导论与环境</div>
+        <div class="desc">为什么是 CUDA / 装环境 / 第一次跑 deviceQuery</div>
+      </a>
+      <a class="card wip" href="ch02-hello/index.html">
+        <div class="num">CHAPTER 02</div>
+        <div class="title">Hello CUDA</div>
+        <div class="desc">第一个 kernel、host↔device 内存拷贝、错误检查</div>
+      </a>
+      <a class="card wip" href="ch03-threads/index.html">
+        <div class="num">CHAPTER 03</div>
+        <div class="title">线程模型与索引</div>
+        <div class="desc">thread/warp/block/grid，1D/2D 索引、向量加</div>
+      </a>
+      <a class="card wip" href="ch04-arch/index.html">
+        <div class="num">CHAPTER 04</div>
+        <div class="title">GPU 硬件架构</div>
+        <div class="desc">SM 内部、warp 调度、SIMT、occupancy</div>
+      </a>
+    </div>
+
+    <div class="stage-banner">阶段 B · 核心（性能优化的灵魂）</div>
+    <div class="roadmap">
+      <a class="card wip" href="ch05-memory/index.html">
+        <div class="num">CHAPTER 05</div>
+        <div class="title">内存层级</div>
+        <div class="desc">global / shared / register，coalescing，带宽实测</div>
+      </a>
+      <a class="card wip" href="ch06-tile/index.html">
+        <div class="num">CHAPTER 06</div>
+        <div class="title">Shared Memory & Tile</div>
+        <div class="desc">Tiled MatMul、bank conflict、double buffer</div>
+      </a>
+      <a class="card wip" href="ch07-reduce/index.html">
+        <div class="num">CHAPTER 07</div>
+        <div class="title">Reduction & Scan</div>
+        <div class="desc">5 阶段 reduce 优化、warp shuffle、histogram</div>
+      </a>
+      <a class="card wip" href="ch08-async/index.html">
+        <div class="num">CHAPTER 08</div>
+        <div class="title">性能分析与异步</div>
+        <div class="desc">Nsight Compute、streams、H2D/计算/D2H overlap</div>
+      </a>
+    </div>
+
+    <div class="stage-banner">阶段 C · LLM 应用（拼装推理引擎）</div>
+    <div class="roadmap">
+      <a class="card wip" href="ch09-gemm/index.html">
+        <div class="num">CHAPTER 09</div>
+        <div class="title">GEMM 深入</div>
+        <div class="desc">naive → tiled → double buffer → WMMA Tensor Core</div>
+      </a>
+      <a class="card wip" href="ch10-softmax/index.html">
+        <div class="num">CHAPTER 10</div>
+        <div class="title">Softmax & Norm</div>
+        <div class="desc">数值稳定 softmax、online softmax、RMSNorm</div>
+      </a>
+      <a class="card wip" href="ch11-attention/index.html">
+        <div class="num">CHAPTER 11</div>
+        <div class="title">Attention 入门</div>
+        <div class="desc">fused QKV、Scaled Dot-Product Attention</div>
+      </a>
+      <a class="card wip" href="ch12-flashattn/index.html">
+        <div class="num">CHAPTER 12</div>
+        <div class="title">FlashAttention</div>
+        <div class="desc">tile + online softmax 融合 kernel</div>
+      </a>
+      <a class="card wip" href="ch13-llm-parts/index.html">
+        <div class="num">CHAPTER 13</div>
+        <div class="title">LLM 必备零件</div>
+        <div class="desc">RoPE / SwiGLU / KV Cache / Sampling</div>
+      </a>
+      <a class="card wip" href="ch14-mini-llm/index.html">
+        <div class="num">CHAPTER 14</div>
+        <div class="title">Capstone: Mini-LLM</div>
+        <div class="desc">用自己的 kernel 跑通 GPT-2 small 端到端推理</div>
+      </a>
+    </div>
+
+    <h2>快速开始</h2>
+
+    <h3>方式 1: Google Colab（推荐初学者）</h3>
+    <p>无需本地 GPU，<a href="https://colab.research.google.com">colab.research.google.com</a> →
+       Runtime → Change runtime type → <strong>T4 GPU</strong> → 打开仓库里的 <code>scripts/setup_colab.ipynb</code>。</p>
+
+    <h3>方式 2: 本地 Linux + NVIDIA GPU</h3>
+<pre><code class="language-bash">git clone https://github.com/YOUR/ops.git && cd ops
+make ARCH=sm_80 -C code/ch02_hello run        # A100/3090
+make ARCH=sm_75 -C code/ch02_hello run        # T4</code></pre>
+
+    <h3>方式 3: 本机 macOS（只学不跑 kernel）</h3>
+<pre><code class="language-bash">python3 -m http.server -d docs 8000           # 预览教程
+clang++ -O2 -std=c++17 -DCPU_ONLY \
+    code/common/cpu_ref_demo.cpp -o /tmp/ref && /tmp/ref   # CPU 端正确性验证</code></pre>
+
+    <h2>这个教程的特点</h2>
+    <ul>
+      <li><strong>每个 kernel 都有 CPU reference 对拍</strong>—— 不靠运气写代码</li>
+      <li><strong>从 deviceQuery 到 FlashAttention 一条龙</strong>—— 没有中间断层</li>
+      <li><strong>讲性能也讲为什么</strong>—— 用 Nsight 看 roofline，不只看 ms</li>
+      <li><strong>面向真实推理栈</strong>—— Ch12-14 直接对标 vLLM / TensorRT-LLM 核心算子</li>
+    </ul>
+
+    <h2>常见问题</h2>
+    <details>
+      <summary>Q: 我没有 NVIDIA 显卡，能学吗？</summary>
+      <p>能。所有 HTML 教程在 macOS / Windows / Linux 上都能读；
+         CPU reference 实现可在任何机器上验证算法正确性；
+         真正想跑 kernel，免费的 Google Colab T4 完全够用（Capstone GPT-2 small 都能跑）。</p>
+    </details>
+    <details>
+      <summary>Q: 已经会用 PyTorch，还需要学 CUDA 吗？</summary>
+      <p>如果你只是用模型，不需要。如果你想：
+        ① 优化推理延迟、② 理解 vLLM/TensorRT-LLM 源码、③ 写自定义算子、④ 准备 GPU 方向面试，
+        那 CUDA 是绕不过去的台阶。</p>
+    </details>
+    <details>
+      <summary>Q: Triton/CUTLASS 这些不是更香吗？</summary>
+      <p>是的，但是要先理解 CUDA 编程模型才能用好它们。本教程在第 12 章会展示 Triton 对照实现，
+         第 9 章会对照 CUTLASS，让你看清"高层抽象"背后到底在做什么。</p>
+    </details>
+    <details>
+      <summary>Q: 学完能达到什么水平？</summary>
+      <p>能独立写出 100~1000 行级别的 CUDA kernel，能读懂主流推理引擎源码，
+         能用 Nsight 定位性能瓶颈。距离"写出能上线的高性能 kernel"还有差距，但这是必要的起点。</p>
+    </details>
+
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+<script src="assets/tutorial.js"></script>
+</body>
+</html>

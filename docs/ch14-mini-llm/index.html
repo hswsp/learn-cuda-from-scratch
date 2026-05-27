@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 14 章 · Capstone: Mini-LLM 推理</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head><body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol><li><a href="../ch01-intro/index.html">导论与环境</a></li><li><a href="../ch02-hello/index.html">Hello CUDA</a></li><li><a href="../ch03-threads/index.html">线程模型与索引</a></li><li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li></ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5"><li><a href="../ch05-memory/index.html">内存层级</a></li><li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li><li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li><li><a href="../ch08-async/index.html">性能分析与异步</a></li></ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9"><li><a href="../ch09-gemm/index.html">GEMM 深入</a></li><li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li><li><a href="../ch11-attention/index.html">Attention 入门</a></li><li><a href="../ch12-flashattn/index.html">FlashAttention</a></li><li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li><li><a href="../ch14-mini-llm/index.html" class="current">Capstone Mini-LLM</a></li></ol>
+      <div class="stage">附录</div><ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 14 章 · Capstone: 用自己写的 kernel 跑 GPT-2 small</h1>
+    <div class="chapter-meta"><span>⏱️ 120 分钟</span><span>🎯 端到端生成文本</span><span>📂 code/ch14_mini_llm/</span><span>🏁 终点</span></div>
+
+    <h2>恭喜你坚持到这里</h2>
+    <p>到第 13 章，你已经手写过：</p>
+    <ul>
+      <li>kernel 启动模板（Ch2-3）</li>
+      <li>shared memory tile（Ch6）</li>
+      <li>warp shuffle reduce（Ch7）</li>
+      <li>tiled GEMM（Ch9）</li>
+      <li>数值稳定 / online softmax（Ch10）</li>
+      <li>attention 三阶段 + FlashAttention（Ch11-12）</li>
+      <li>RoPE / SwiGLU / KV cache / sampling（Ch13）</li>
+    </ul>
+    <p>本章把它们<strong>串成一个能跑的 GPT-2 small (124M)</strong>。</p>
+
+    <h2>14.1 GPT-2 small 架构速览</h2>
+<pre class="mermaid">
+graph TD
+    Tok["token ids (T,)"] --> Emb["embedding: wte + wpe<br/>(T, 768)"]
+    Emb --> Loop["× 12 layers"]
+    Loop --> LN1["LayerNorm"]
+    LN1 --> Attn["fused QKV → causal MHA → out_proj"]
+    Attn --> Res1["+ residual"]
+    Res1 --> LN2["LayerNorm"]
+    LN2 --> MLP["fc (768→3072) → GeLU → fc_proj (3072→768)"]
+    MLP --> Res2["+ residual"]
+    Res2 --> Loop
+    Res2 --> LNF["final LayerNorm"]
+    LNF --> Head["logits = h @ wte^T  (T, 50257)"]
+    Head --> Smp["argmax / top-k / top-p → next token"]
+    style Loop fill:#f6f8fa,stroke:#0969da
+    style Attn fill:#f6f8fa,stroke:#bf8700
+</pre>
+
+    <table>
+      <tr><th>参数</th><th>GPT-2 small</th></tr>
+      <tr><td>层数 n_layer</td><td>12</td></tr>
+      <tr><td>头数 n_head</td><td>12</td></tr>
+      <tr><td>隐层 d_model</td><td>768</td></tr>
+      <tr><td>FFN 中间 d_ff</td><td>3072</td></tr>
+      <tr><td>head_dim</td><td>64</td></tr>
+      <tr><td>词表 vocab_size</td><td>50257</td></tr>
+      <tr><td>最大上下文</td><td>1024</td></tr>
+      <tr><td>参数量</td><td>124M (fp16 ~250 MB)</td></tr>
+    </table>
+
+    <h2>14.2 三步上手</h2>
+
+    <h3>Step 1 — 下载权重</h3>
+<pre><code class="language-bash">pip install transformers torch
+python data/download_gpt2.py --out data/gpt2-small.bin
+# 输出: data/gpt2-small.bin (~250 MB, fp16)</code></pre>
+
+    <p>脚本会把 HuggingFace 的 <code>gpt2</code> 权重按固定二进制 layout 序列化，方便 C++ 一次 fread。
+       文件头是 16 个 int32（含 n_layer / n_head / d_model 等），后接 fp16 张量流。</p>
+
+    <h3>Step 2 — 编译与运行</h3>
+<pre><code class="language-bash">cd code/ch14_mini_llm
+make ARCH=sm_80
+./mini_llm --weights=../../data/gpt2-small.bin \
+           --tokens=15496,11,612,318 \
+           --max_new=10</code></pre>
+
+    <h3>Step 3 — token ↔ 文本</h3>
+    <p>本仓库为简化没在 C++ 里写 BPE tokenizer。
+       用 Python 编码 / 解码：</p>
+<pre><code class="language-python">from transformers import GPT2Tokenizer
+tok = GPT2Tokenizer.from_pretrained("gpt2")
+ids = tok.encode("Hello, there is")
+print(ids)                  # → [15496, 11, 612, 318]
+# 把上面 ids 传给 mini_llm --tokens=...
+# 然后把它打印出的 final tokens 复制回 Python:
+print(tok.decode([15496, 11, 612, 318, 1043, 257, 1810, 2950, 287]))</code></pre>
+
+    <h2>14.3 forward() 的结构</h2>
+    <p>源码：<a href="../../code/ch14_mini_llm/mini_llm.cu">mini_llm.cu</a>。
+       核心 forward 函数把所有 kernel 按顺序串起来，每步：</p>
+
+<pre><code class="language-cpp">void forward(const Weights&amp; W, std::vector&lt;int&gt;&amp; tokens, int* next) {
+    embed_kernel(wte, wpe, tokens, x);            // (T, D)
+
+    for (int l = 0; l &lt; n_layer; ++l) {
+        layernorm_row(x, ln1_w, ln1_b, normed);
+        matmul_kernel(normed, qkv_w, qkv);        // Ch6 tile
+        bias_add(qkv, qkv_b);
+        split_qkv(qkv, Q, K, V);
+        mha_naive(Q, K, V, attn_out);             // Ch11 naive
+        matmul_kernel(attn_out, proj_w, proj_out);
+        bias_add(proj_out, proj_b);
+        residual_add(x, proj_out);                // x += proj_out
+
+        layernorm_row(x, ln2_w, ln2_b, normed);
+        matmul_kernel(normed, fc_w, ff_mid);      // (T, d_ff)
+        bias_add(ff_mid, fc_b);
+        gelu_kernel(ff_mid);                       // Ch13 风格激活
+        matmul_kernel(ff_mid, fcp_w, ff_out);      // (T, D)
+        bias_add(ff_out, fcp_b);
+        residual_add(x, ff_out);
+    }
+
+    layernorm_row(x, lnf_w, lnf_b, normed);
+    gemv_logits(normed[T-1], wte, logits);         // (V,)
+    greedy_argmax(logits, next);
+}</code></pre>
+
+    <h2>14.4 简化与代价</h2>
+    <table>
+      <tr><th>简化</th><th>代价</th><th>怎么补救</th></tr>
+      <tr><td>fp32 全程</td><td>显存 2×，算力慢 8×</td><td>fp16 + WMMA（Ch9）</td></tr>
+      <tr><td>朴素 attention</td><td>O(T²) 显存</td><td>用 Ch12 FlashAttention 替换</td></tr>
+      <tr><td>每步全前向（无 KV cache）</td><td>O(T³) 总成本</td><td>加 KV cache（练习 #1）</td></tr>
+      <tr><td>batch=1</td><td>GPU 空跑</td><td>支持 batch + padding mask</td></tr>
+      <tr><td>greedy only</td><td>无创意</td><td>实现 top-k/top-p (Ch13 练习)</td></tr>
+    </table>
+
+    <p>即便如此，本章 GPT-2 small 在 T4 上能跑出 ~2-5 tok/s（无优化），足以验证流程。
+       把上面 5 项优化全做完，可以追到 ~50-100 tok/s（接近 llama.cpp 在同样硬件的水平）。</p>
+
+    <h2>14.5 扩展任务（按难度）</h2>
+
+    <h3>★ 入门</h3>
+    <ol>
+      <li>支持 prompt 长度 &gt; 16：测试 <code>--max_new=64</code></li>
+      <li>把 greedy 换成 temperature=0.8 + top-k=40</li>
+      <li>用 nsys 看一次 forward 的 timeline，找最大 kernel</li>
+    </ol>
+
+    <h3>★★ 进阶</h3>
+    <ol>
+      <li><strong>加 KV cache</strong>：维护 K_cache / V_cache (n_layer, n_head, T_max, D_head)，每步只 forward 1 token。预期：单步从 50 ms 降到 5 ms。</li>
+      <li>fp16 路径：fc/proj/qkv 用 WMMA。Ch9 模板可移植。</li>
+      <li>用 Ch12 FlashAttention 替换 mha_naive。</li>
+    </ol>
+
+    <h3>★★★ 挑战</h3>
+    <ol>
+      <li><strong>continuous batching</strong>：多请求并发，按 token 调度而非按请求。这是 vLLM 的核心创新。</li>
+      <li><strong>W4A16 量化</strong>：把权重压成 INT4，runtime 解 → fp16 GEMM。看 llama.cpp / AWQ 实现。</li>
+      <li><strong>speculative decoding</strong>：用 distilgpt2 当 draft，gpt2 当 verifier，3-5× 加速。</li>
+      <li><strong>移植到 Llama 架构</strong>：把 LayerNorm 换 RMSNorm、GeLU 换 SwiGLU、加 RoPE、加 GQA。</li>
+    </ol>
+
+    <h2 id="industry">14.6 工业实战：从能跑到能上线</h2>
+
+    <p>capstone 能在单卡跑通 GPT-2 small。距离<strong>给真实用户服务</strong>还差 6 个工程组件，本节给概念地图。</p>
+
+    <h3>14.6.1 连续批处理 (Continuous Batching)</h3>
+
+    <p>朴素 batch：N 个请求攒齐再 forward，慢的拖快的（"head-of-line blocking"）。<strong>Continuous batching</strong> 是 iteration-level scheduling——每个 token 步骤独立组 batch，新请求随时插入，完成的随时移出。</p>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant Q as RequestQueue
+    participant S as Scheduler
+    participant E as Engine
+    Q->>S: req A, prompt T=100
+    Q->>S: req B, prompt T=50
+    S->>E: prefill A, B together
+    Note over E: 同 batch 处理 prefill
+    E->>S: gen token A=t1, B=t1
+    Q->>S: req C, prompt T=20
+    S->>E: prefill C plus decode A, B
+    E->>S: A=t2, B=t2, C=t1
+    Note over Q,E: B 提前完成, 出 batch, 槽位让给新请求
+</pre>
+
+    <p>核心数据结构：<strong>request slot 数组</strong>，每个 slot 持有 (state=prefill/decode, KV pages, current token, sampling params)。每步根据 slot 状态组 batch。</p>
+
+    <p>vLLM、TGI、TensorRT-LLM 都内置。<strong>实测吞吐 5-10×</strong>（vs 静态 batch）。</p>
+
+    <h3>14.6.2 PagedAttention KV 管理（集成版）</h3>
+
+    <p>12.9.4 给了算法，在 mini_llm 里集成步骤：</p>
+    <ol>
+      <li>K_cache / V_cache 改成 <strong>page pool</strong>：<code>K_blocks (n_blocks, block_size, n_head, D_head)</code></li>
+      <li>每请求一个 <strong>block_table</strong>：<code>logical_block_id → physical_block_id</code></li>
+      <li>attention kernel 通过 block_table 间接寻址</li>
+      <li>Scheduler 维护 free block pool；新请求 alloc，结束归还</li>
+    </ol>
+
+    <p>陷阱：block 大小要平衡。太大（256+）→ 内部碎片；太小（4-）→ block_table 大、kernel indirection 开销大。生产典型 <strong>16 token / block</strong>。</p>
+
+    <h3>14.6.3 多 GPU：TP / PP / EP / SP</h3>
+
+    <p>单卡装不下（70B fp16 = 140 GB）时分卡跑：</p>
+    <table>
+      <tr><th>策略</th><th>切分方式</th><th>通信</th><th>适合</th></tr>
+      <tr><td>Tensor Parallel (TP)</td><td>每层权重按列/行切多卡</td><td>每层 1-2 次 all-reduce</td><td>同节点（NVLink）</td></tr>
+      <tr><td>Pipeline Parallel (PP)</td><td>层切到不同卡</td><td>层之间 send/recv</td><td>跨节点（IB）</td></tr>
+      <tr><td>Expert Parallel (EP)</td><td>MoE expert 分卡</td><td>token all-to-all</td><td>Mixtral / GPT-OSS</td></tr>
+      <tr><td>Sequence Parallel (SP)</td><td>序列维度切</td><td>跟 TP 配合</td><td>长 context 训练</td></tr>
+    </table>
+
+    <p>典型 70B 推理：<strong>TP=8, PP=1</strong>（单节点 8×A100/H100）。kernel 改动：QKV proj 输出维度 ÷TP，attention head ÷TP，FFN 中间维 ÷TP，每层最后 1 次 all-reduce (NCCL)。</p>
+
+    <h3>14.6.4 CUDA Graph capture — 杀掉 launch overhead</h3>
+
+    <p>单 token decode 触发 30-50 个 kernel × 每个 ~5 μs launch = 150-250 μs 纯开销，跟计算同量级。capture 成一个 Graph 后重放只 1 次 launch：</p>
+
+<pre><code class="language-cpp">// warmup 时同时 capture
+cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+decode_one_step(...);
+cudaStreamEndCapture(stream, &amp;graph);
+cudaGraphInstantiate(&amp;exec, graph, ...);
+
+// 之后每步只 1 次 launch
+cudaGraphLaunch(exec, stream);</code></pre>
+
+    <p>坑：</p>
+    <ul>
+      <li>kernel 参数（KV 位置等）必须编译期常量。生产用 <code>cudaGraphExecKernelNodeSetParams</code> 动态更新</li>
+      <li>batch size 变化要重新 capture；预 capture 几组 (1, 2, 4, 8, 16, 32) 的 graph</li>
+      <li>动态 KV 长度需要 padding 到固定 bucket，浪费一些算力换 graph 复用</li>
+    </ul>
+
+    <h3>14.6.5 服务化工程要点</h3>
+    <ul>
+      <li><strong>异步 IO</strong>：HTTP queue → 内部 scheduler；asyncio / tokio。不能阻塞 GPU stream</li>
+      <li><strong>流式输出</strong>：每生成一个 token 立即 SSE / gRPC streaming 推回 client</li>
+      <li><strong>请求超时与取消</strong>：client 关连接，对应 slot 立即释放 KV blocks</li>
+      <li><strong>动态 max_tokens</strong>：根据队列长度调整，繁忙时拒绝过长生成</li>
+      <li><strong>warmup</strong>：服务起后跑虚拟请求预热 cuBLAS / CUDA Graph，否则前几个真请求慢 3-10×</li>
+      <li><strong>OOM 防护</strong>：admission control 估算每请求需要多少 KV blocks，不够就排队</li>
+      <li><strong>多副本 + 自动扩缩容</strong>：K8s + HPA</li>
+      <li><strong>监控</strong>：p50/p95/p99 latency、tokens/s、queue length、KV 占用率、GPU util</li>
+    </ul>
+
+    <h3>14.6.6 生产 LLM 推理栈对比（2025）</h3>
+
+    <table>
+      <tr><th>方案</th><th>典型场景</th><th>优势</th><th>劣势</th></tr>
+      <tr><td><strong>vLLM</strong></td><td>开源 / Python 友好</td><td>PagedAttention 原作、CB、Triton kernel 易改</td><td>fp8/int4 集成稍落后</td></tr>
+      <tr><td><strong>TensorRT-LLM</strong></td><td>NVIDIA 平台极致</td><td>fp8/int4/SmoothQuant 全面，Builder 自动 fuse</td><td>build time 长，新模型需 plugin</td></tr>
+      <tr><td><strong>llama.cpp</strong></td><td>CPU / Mac / 边缘</td><td>GGUF 量化精细、跨平台</td><td>多 GPU 推理弱</td></tr>
+      <tr><td><strong>SGLang</strong></td><td>复杂控制流 / agent / JSON 输出</td><td>RadixAttention 前缀共享、结构化生成</td><td>生态较小</td></tr>
+      <tr><td><strong>TGI (HF)</strong></td><td>跟 HuggingFace 生态对接</td><td>开箱即用、Rust 服务层</td><td>性能略落后 vLLM</td></tr>
+      <tr><td><strong>自研 (Meta/Anthropic)</strong></td><td>顶级公司</td><td>极致性能、隐藏权重</td><td>人年级投入</td></tr>
+    </table>
+
+    <h3>14.6.7 推荐工程化路径</h3>
+    <ol>
+      <li><strong>原型</strong>：vLLM docker 一行命令</li>
+      <li><strong>生产</strong>：vLLM 或 TRT-LLM；按 NVIDIA 平台粘度选</li>
+      <li><strong>极致优化</strong>：基于 CUTLASS / Triton 自写关键 kernel（attention、量化 GEMM），其他算子复用</li>
+      <li><strong>跨平台</strong>：llama.cpp (Mac / CPU)、MLX (Apple Silicon)、ROCm (AMD)</li>
+    </ol>
+
+    <h3>14.6.8 学完本教程能做什么</h3>
+    <ul>
+      <li>读懂 vLLM / TRT-LLM / llama.cpp 任一个的 CUDA kernel</li>
+      <li>给自己模型在 vLLM 里加自定义 fused 算子</li>
+      <li>实现 attention 变体（local / ALiBi / custom mask）</li>
+      <li>调优 LLM 服务把 p99 latency 降一半</li>
+      <li>面试 GPU/CUDA 岗位，能答 FlashAttention 推导和 PagedAttention 原理</li>
+    </ul>
+
+    <p>这是<strong>起点</strong>不是终点。顶级 CUDA 工程师还需 3-5 年实际项目经验，但你已经过了"看不懂代码"的门槛。</p>
+
+    <h2 id="frontier">14.7 研究前沿（2025-2026）：Disaggregated Serving、MoE、Reasoning</h2>
+
+    <h3>14.7.1 Disaggregated Prefill / Decode（Mooncake、DistServe）</h3>
+
+    <p>14.6 讲了 prefill 和 decode 是两个不同世界（compute-bound vs memory-bound）。<strong>共享 GPU 跑两者</strong>意味着两边都不能最优——prefill 抢占 SM 会拖慢 decode 的尾延迟。</p>
+
+    <p>2024-2025 的革命：<strong>把 prefill 和 decode 分到不同 GPU pool</strong>，KV cache 通过高速网络传递。</p>
+
+<pre class="mermaid">
+graph LR
+    A["用户请求"] --> B["调度器"]
+    B --> P1["Prefill GPU pool<br/>(compute-bound, 大 batch)"]
+    P1 -->|"KV 传输<br/>NVLink/IB"| D1["Decode GPU pool<br/>(memory-bound, 小 batch)"]
+    D1 --> O["流式输出"]
+    style P1 fill:#f6f8fa,stroke:#0969da
+    style D1 fill:#f6f8fa,stroke:#1a7f37
+</pre>
+
+    <p>主要工程实现：</p>
+    <ul>
+      <li><strong>Mooncake</strong>（Moonshot AI / Kimi 2024）：业内首个生产 disaggregated 系统，KV 通过 RDMA 传输，全局 KV pool 跨节点共享</li>
+      <li><strong>DistServe</strong>（OSDI 2024 论文）：理论分析 + 早期开源实现</li>
+      <li><strong>vLLM v0.7+</strong>：内置 disaggregated 路径</li>
+      <li><strong>SGLang</strong>：同样支持</li>
+      <li><strong>llm-d</strong>（Red Hat / IBM 2025）：Kubernetes 原生 disaggregated 框架</li>
+    </ul>
+
+    <p>典型收益：吞吐 +30-50%，p99 latency 减半，<strong>tokens/$ 提升 2-3×</strong>。但工程复杂度高，小规模团队（&lt; 10 GPU）不划算。</p>
+
+    <h3>14.7.2 MoE 推理 — Expert Parallel 是新刚需</h3>
+
+    <p>2024-2025 大模型几乎全转 MoE：DeepSeek-V3 671B（37B 激活）、Llama 4 Maverick 400B、Qwen 3 235B、Mixtral 8×22B 等。共同点：</p>
+    <ul>
+      <li>总参数 100B+，但每 token 只激活 ~10-15% expert</li>
+      <li>显存 / HBM 流量瓶颈极重</li>
+      <li>路由不均衡（hot expert 卡死）</li>
+    </ul>
+
+    <h4>Expert Parallel (EP)</h4>
+<pre><code>每张 GPU 装一部分 expert (例如 64 expert / 8 GPU = 8 expert/GPU)
+每 token 路由到 top-k expert (典型 k=2 或 8)
+跨 GPU 通信: all-to-all (一次发, 一次收)</code></pre>
+
+    <p>挑战：</p>
+    <ul>
+      <li>all-to-all 时网络带宽是瓶颈 — 必须 NVLink 或 IB</li>
+      <li>路由不均衡 — 用 DeepSeek-V3 的 <strong>aux-loss-free balancing</strong> 或 expert capacity factor</li>
+      <li>Expert 跨 GPU 调度 — vLLM <strong>fused MoE kernel</strong>、SGLang 都有自己实现</li>
+    </ul>
+
+    <h4>实战：DeepSeek-V3 推理架构</h4>
+    <ul>
+      <li>单实例 = 32 GPU H800 (4 节点 × 8 卡)</li>
+      <li>TP=8（每节点）+ EP=32 + PP=1</li>
+      <li>每节点 NVLink 内 all-to-all，节点间 IB</li>
+      <li>FlashMLA + paged KV + fp8 GEMM</li>
+      <li>实测 ~3000 tokens/s per实例（B=128 并发）</li>
+    </ul>
+
+    <h3>14.7.3 Reasoning 模型的 serving</h3>
+
+    <p>o1 / R1 / Gemini Thinking 等 reasoning 模型对推理服务的<strong>颠覆性影响</strong>：</p>
+
+    <table>
+      <tr><th>维度</th><th>普通 LLM（如 GPT-4）</th><th>Reasoning LLM</th></tr>
+      <tr><td>典型 output length</td><td>200-2000 token</td><td>5K-100K token</td></tr>
+      <tr><td>用户等待</td><td>3-30 秒</td><td>30 秒 - 10 分钟</td></tr>
+      <tr><td>prefill / decode 比</td><td>2:1</td><td>1:50 - 1:200</td></tr>
+      <tr><td>每请求 KV peak</td><td>~MB</td><td>~GB</td></tr>
+      <tr><td>关键 metric</td><td>p50 latency</td><td>tokens/sec/user, 总成本</td></tr>
+    </table>
+
+    <p>服务系统的调整：</p>
+    <ul>
+      <li><strong>BIG KV pool</strong>：单请求几 GB，PagedAttention 必须</li>
+      <li><strong>Speculative decoding 收益巨大</strong>（n-gram lookahead 命中率 50%+，因为 thinking 多有重复模式）</li>
+      <li><strong>Streaming 必须</strong>：用户看 thinking 流</li>
+      <li><strong>取消机制</strong>：用户可能中途打断 thinking，要立即释放 KV</li>
+    </ul>
+
+    <h3>14.7.4 Prefix Caching 的演进</h3>
+
+    <p>2024-2025 prefix caching 从 "memory cache" 升级到 "<strong>持久化共享池</strong>"：</p>
+    <ul>
+      <li><strong>SGLang RadixAttention</strong>：进程内 trie 缓存</li>
+      <li><strong>LMCache / vLLM Cache</strong>（2024）：跨进程 KV 共享，RDMA 传输</li>
+      <li><strong>Mooncake Conductor</strong>：全集群 KV pool, 用 CRUSH 算法分布</li>
+      <li><strong>磁盘 / SSD KV cache</strong>：冷 prefix 卸载，需要时拉回</li>
+    </ul>
+
+    <p>对 chat 工作负载（系统 prompt + 多轮对话）效果惊人：<strong>命中率 80%+，吞吐翻 3-5×</strong>。是 2025 推理服务 must-have。</p>
+
+    <h3>14.7.5 多模态推理：vision + audio + text</h3>
+
+    <p>Gemini 2.0 / GPT-4o / Llama 4 都是原生多模态。推理服务变化：</p>
+    <ul>
+      <li><strong>vision encoder</strong>：ViT 或 SigLIP，前置阶段 GPU 跑（compute-bound）</li>
+      <li><strong>token 化</strong>：image / audio 转 visual tokens 喂给 LLM</li>
+      <li><strong>异构 batch</strong>：text-only 请求和 multimodal 请求形状不同, scheduler 复杂</li>
+      <li><strong>encoder 缓存</strong>：相同图片不重复 encode</li>
+    </ul>
+
+    <p>典型部署：vision encoder 作为<strong>独立微服务</strong>（甚至独立 GPU），LLM serving 拉它的输出 token。跟 disaggregated prefill 思路相通。</p>
+
+    <h3>14.7.6 Agentic / Computer Use serving</h3>
+
+    <p>2024-2025 Claude Computer Use、OpenAI Operator、AutoGPT 等"<strong>agent</strong>"：模型自动循环调用工具。serving 挑战：</p>
+    <ul>
+      <li><strong>长 turn-by-turn 对话</strong>：每 turn 都附上完整历史 + 工具调用结果</li>
+      <li><strong>高度 prefix cache 命中</strong>：tool call 模式重复</li>
+      <li><strong>不确定的 token 预算</strong>：可能 1 个 turn 也可能 50 个 turn</li>
+      <li><strong>需要 KV cache 持久化</strong>：一个 session 可能跑数分钟，断开重连也要恢复</li>
+    </ul>
+
+    <h3>14.7.7 2026 LLM 推理栈对比（更新版）</h3>
+
+    <table>
+      <tr><th>方案</th><th>典型场景</th><th>2026 优势</th></tr>
+      <tr><td>vLLM v0.7+</td><td>开源主流</td><td>chunked prefill / disagg / EP / Multi-LoRA</td></tr>
+      <tr><td>SGLang</td><td>复杂控制流, agent</td><td>RadixAttention + 结构化生成 + 程序化 LM</td></tr>
+      <tr><td>TensorRT-LLM</td><td>NVIDIA 平台极致</td><td>fp4/fp8 全栈 + Builder fuse + B200/H200</td></tr>
+      <tr><td>DeepSpeed-MII</td><td>训练栈 + 推理</td><td>跟 DeepSpeed 训练绑定深</td></tr>
+      <tr><td>Mooncake</td><td>大规模 disagg</td><td>跨节点 KV pool, 国内大厂</td></tr>
+      <tr><td>llm-d</td><td>K8s 原生</td><td>Red Hat / IBM 集成方便</td></tr>
+      <tr><td>Fireworks / Together / Anyscale</td><td>API 服务商</td><td>多 LoRA 共享 + 商业 SLA</td></tr>
+      <tr><td>llama.cpp</td><td>边缘 / Mac / CPU</td><td>GGUF 量化精细, 2025 加 Apple Silicon GPU</td></tr>
+      <tr><td>MLX</td><td>Apple Silicon</td><td>Mac 上 LLM 推理事实标准</td></tr>
+    </table>
+
+    <h3>14.7.8 推理硬件软件全栈 (2026 全景)</h3>
+
+<pre><code>用户                ┌────────────────────────────────────┐
+请求 ──────────────►│   API 网关 (FastAPI, gRPC, OpenAI 兼容)  │
+                    └──────────────┬─────────────────────┘
+                                   │
+                    ┌──────────────▼─────────────────────┐
+                    │   调度器 (continuous batching,      │
+                    │   prefix caching, 投机, multi-LoRA) │
+                    └──────────┬───┬─────────────────────┘
+                               │   │
+                    ┌──────────▼─┐ ▼──────────────────────┐
+                    │ Prefill    │ │ Decode pool          │
+                    │ pool       │ │ (B200 fp4)           │
+                    │ (B200 fp8) │ │                      │
+                    └─────┬──────┘ └──────┬───────────────┘
+                          │  KV 传输      │
+                          ▼  (NVLink-C2C  ▼
+                          │   或 IB)
+                  ┌───────┴──────────────┴────────────┐
+                  │  全局 KV cache pool                │
+                  │  (LMCache / Mooncake Conductor)    │
+                  └────────────────────────────────────┘
+</code></pre>
+
+    <h3>14.7.9 学完本教程在 2026 LLM 行业能做什么</h3>
+
+    <p>恭喜！你已经具备：</p>
+    <ul>
+      <li>读懂 vLLM / SGLang / TRT-LLM / FlashAttention / FlashMLA / Marlin 任何一个 CUDA kernel</li>
+      <li>给生产推理引擎贡献自定义 fused 算子（norm + GEMM + activation）</li>
+      <li>实现新 attention 变体（local / sliding / linear / MLA）</li>
+      <li>调优 LLM 服务把 p99 减半</li>
+      <li>面试 GPU/CUDA、LLM Inference Engineer 岗位</li>
+      <li>评估新硬件（B200 / MI325X / TPU v7）适合不适合自己工作负载</li>
+      <li>跟上 2025-2026 论文（FA v3/v4、MLA、QuaRot、QServe、Mooncake、EAGLE-3）</li>
+    </ul>
+
+    <p>下一步建议：</p>
+    <ol>
+      <li>挑一个真实 OSS 项目（vLLM / SGLang）做一个 PR：加 fused 算子 / 修 bug / 加 model 支持</li>
+      <li>读 DeepSeek-V3 / FlashAttention v3 / Mooncake 三篇论文 + 对应源码</li>
+      <li>关注 <code>github.com/NVIDIA/cutlass</code>、<code>HazyResearch/ThunderKittens</code>、<code>triton-lang/triton</code> 的 release 动态</li>
+      <li>关注 Lecture 系列：<a href="https://github.com/gpu-mode/lectures">GPU MODE</a> 是 2024-2026 最活跃的 GPU 编程社区</li>
+    </ol>
+
+    <h2>14.8 后续学习路径</h2>
+    <ul>
+      <li>📖 <a href="https://github.com/Dao-AILab/flash-attention">FlashAttention 官方</a> — 看 v2/v3 的 CUTLASS 实现</li>
+      <li>📖 <a href="https://github.com/vllm-project/vllm">vLLM</a> — 学 PagedAttention、continuous batching</li>
+      <li>📖 <a href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM</a> — 看工业级 builder + plugin</li>
+      <li>📖 <a href="https://github.com/ggerganov/llama.cpp">llama.cpp</a> — 看极致 CPU + GGUF 量化</li>
+      <li>📖 <a href="https://github.com/NVIDIA/cutlass">CUTLASS</a> + CuTe — 看 GEMM 工厂</li>
+      <li>📖 <a href="https://github.com/triton-lang/triton">Triton</a> — Python-like GPU DSL</li>
+      <li>📖 <a href="https://github.com/sgl-project/sglang">SGLang</a> — RadixAttention、结构化生成</li>
+      <li>📖 <a href="https://github.com/NVIDIA/Megatron-LM">Megatron-LM</a> — 多卡训练 TP/PP/SP 经典实现</li>
+    </ul>
+
+    <h2>14.9 总结</h2>
+    <p>你从 <code>__global__ void hello_kernel()</code> 走到了<strong>用自己写的 kernel 跑出语言模型生成</strong>。
+       中间所有让你停下来调试的 bug，对将来读 vLLM 源码、写自定义算子都是直接经验。GPU 编程的"硬功夫"就这样炼出来的。</p>
+
+    <p>下一步：选一个真实仓库（推荐 llama.cpp 或 vLLM）读一个 kernel 实现，对照本教程章节复盘。
+       恭喜！🎉</p>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch13-llm-parts/index.html"><span class="label">上一章</span>← 13 · LLM 零件</a>
+      <a class="next" href="../index.html"><span class="label">回顶</span>🏠 学习路径</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body></html>

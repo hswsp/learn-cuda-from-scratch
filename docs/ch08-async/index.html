@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 8 章 · 性能分析与异步执行</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head><body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol><li><a href="../ch01-intro/index.html">导论与环境</a></li><li><a href="../ch02-hello/index.html">Hello CUDA</a></li><li><a href="../ch03-threads/index.html">线程模型与索引</a></li><li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li></ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5"><li><a href="../ch05-memory/index.html">内存层级</a></li><li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li><li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li><li><a href="../ch08-async/index.html" class="current">性能分析与异步</a></li></ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9"><li><a href="../ch09-gemm/index.html">GEMM 深入</a></li><li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li><li><a href="../ch11-attention/index.html">Attention 入门</a></li><li><a href="../ch12-flashattn/index.html">FlashAttention</a></li><li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li><li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li></ol>
+      <div class="stage">附录</div><ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 8 章 · 性能分析与异步执行</h1>
+    <div class="chapter-meta"><span>⏱️ 60 分钟</span><span>🎯 用 Nsight 找瓶颈</span><span>📂 code/ch08_async/</span></div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>会用 Nsight Compute（kernel 内部）和 Nsight Systems（系统级 timeline）</li>
+      <li>读懂 roofline、内存吞吐、stall reason 等关键指标</li>
+      <li>用 CUDA streams 让 H2D / 计算 / D2H 三阶段并行</li>
+      <li>用 CUDA Graphs 把"成千上万次 launch"压成一次</li>
+    </ul>
+
+    <h2 id="roofline">8.1 Roofline 模型：在哪个屋顶下？</h2>
+    <p>性能分析的第一原则：先看你<strong>受限于什么</strong>。</p>
+
+<pre class="mermaid">
+graph LR
+    A["算术强度 (FLOP/Byte)"] --> B{"比较"}
+    B -->|"低"| M["Memory-bound<br/>瓶颈在带宽"]
+    B -->|"高"| C["Compute-bound<br/>瓶颈在算力"]
+    M --> M1["优化方向:<br/>coalescing<br/>shared mem 复用<br/>量化降位宽"]
+    C --> C1["优化方向:<br/>Tensor Core<br/>算子融合<br/>增大 batch"]
+    style M fill:#f6f8fa,stroke:#bf8700
+    style C fill:#f6f8fa,stroke:#1a7f37
+</pre>
+
+    <p>LLM 推理（小 batch）通常是 memory-bound——所有的工程套路（KV cache 优化、量化、PagedAttention）都为了减少访存。
+       LLM 训练 / 大 batch 推理偏 compute-bound——所以 Tensor Core / FP8 是关键。</p>
+
+    <h2 id="nsight">8.2 Nsight 工具链</h2>
+    <table>
+      <tr><th>工具</th><th>颗粒度</th><th>看什么</th><th>调用</th></tr>
+      <tr><td>Nsight Systems (nsys)</td><td>系统级</td><td>CPU/GPU timeline, stream overlap, idle gap</td><td><code>nsys profile ./app</code></td></tr>
+      <tr><td>Nsight Compute (ncu)</td><td>单 kernel 内</td><td>roofline, occupancy, stall reason, bank conflict 计数</td><td><code>ncu --set full ./app</code></td></tr>
+      <tr><td>nvprof (deprecated)</td><td>—</td><td>同上但简化版</td><td>—</td></tr>
+    </table>
+
+    <h3>典型工作流</h3>
+<pre><code class="language-bash"># 1. nsys 找 "kernel 占多少时间 / 哪里有 idle / H2D 重叠了吗"
+nsys profile --stats=true --force-overwrite=true -o report.nsys-rep ./my_app
+nsys stats report.nsys-rep     # 命令行表格
+
+# 2. ncu 钻到具体某个 kernel 看为什么慢
+ncu --set full --kernel-name matmul_tiled -o report.ncu-rep ./my_app
+ncu-ui report.ncu-rep          # 图形界面看 roofline、source counter</code></pre>
+
+    <div class="callout">
+      <strong>Nsight 在 Colab？</strong> nsys / ncu 都自带在 Colab GPU runtime 里, 但 UI 看图需要下载 .nsys-rep / .ncu-rep 到本地用 Nsight Desktop 打开。
+    </div>
+
+    <h2>8.3 关键指标速读</h2>
+    <table>
+      <tr><th>指标</th><th>名字</th><th>意思</th><th>触发动作</th></tr>
+      <tr><td>SM Throughput</td><td><code>sm__throughput</code></td><td>SM 利用率</td><td>太低 → 增加 occupancy 或 ILP</td></tr>
+      <tr><td>Memory Throughput</td><td><code>dram__throughput</code></td><td>HBM 利用率</td><td>太低 → 检查 coalescing</td></tr>
+      <tr><td>L1 Hit Rate</td><td><code>l1tex__t_sectors_pipe_lsu_mem_global_op_ld_hit_rate</code></td><td>L1 命中</td><td>低 → tile 改大或换 stride</td></tr>
+      <tr><td>Stall: Long Scoreboard</td><td>—</td><td>在等内存</td><td>kernel memory-bound</td></tr>
+      <tr><td>Stall: Math Pipe Throttle</td><td>—</td><td>在等算力单元</td><td>kernel compute-bound</td></tr>
+      <tr><td>Achieved Occupancy</td><td>—</td><td>实际驻留 warp%</td><td>低 → 改 block size / 减寄存器</td></tr>
+      <tr><td>Bank Conflicts</td><td><code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared</code></td><td>shared 冲突计数</td><td>非 0 → padding 或换 layout</td></tr>
+    </table>
+
+    <h2 id="streams">8.4 CUDA Streams — H2D 与计算重叠</h2>
+    <p>默认 stream（NULL stream）上所有操作串行。开多个 stream，CUDA 才能并发执行：</p>
+
+<pre class="mermaid">
+sequenceDiagram
+    participant H as Host
+    participant S1 as Stream_1
+    participant S2 as Stream_2
+    Note over H,S2: Async chunk 切片，每片走独立 stream
+    H ->> S1: H2D chunk 0
+    H ->> S2: H2D chunk 1
+    S1 ->> S1: kernel chunk 0
+    S2 ->> S2: kernel chunk 1
+    S1 ->> H: D2H chunk 0
+    S2 ->> H: D2H chunk 1
+</pre>
+
+    <p>实现要点：</p>
+    <ol>
+      <li>host buffer 必须是 <strong>pinned</strong>（cudaMallocHost），否则 cudaMemcpyAsync 退化成同步</li>
+      <li>用 cudaMemcpyAsync，传 stream 参数</li>
+      <li>kernel 启动加第 4 个尖括号参数：<code>kernel&lt;&lt;&lt;g, b, 0, streamX&gt;&gt;&gt;(...)</code></li>
+    </ol>
+
+<pre><code class="language-cpp">cudaStream_t streams[4];
+for (int i = 0; i &lt; 4; ++i) cudaStreamCreate(&amp;streams[i]);
+
+for (int s = 0; s &lt; 4; ++s) {
+    int off = s * chunk;
+    cudaMemcpyAsync(d + off, h + off, chunk * 4, cudaMemcpyHostToDevice, streams[s]);
+    my_kernel&lt;&lt;&lt;g, b, 0, streams[s]&gt;&gt;&gt;(d + off, chunk);
+    cudaMemcpyAsync(h + off, d + off, chunk * 4, cudaMemcpyDeviceToHost, streams[s]);
+}
+for (int s = 0; s &lt; 4; ++s) cudaStreamSynchronize(streams[s]);</code></pre>
+
+    <p>实测见 <a href="../../code/ch08_async/multi_stream.cu">multi_stream.cu</a>。典型加速 1.5–2.5×（取决于 H2D 与 kernel 时间的比值）。</p>
+
+    <h2 id="graphs">8.5 CUDA Graphs — 干掉 launch overhead</h2>
+    <p>每次 kernel launch 大约消耗 5-10 μs。LLM 推理一个 token 要触发几十次 kernel → launch 开销可达毫秒级，对小 model 来说致命。</p>
+
+    <p>CUDA Graphs 思路：<strong>把一连串 launch "录制"</strong>成一个图对象，重放时只付一次 launch 开销。</p>
+
+<pre><code class="language-cpp">cudaGraph_t graph;
+cudaGraphExec_t exec;
+
+// 1) 进入 capture 模式
+cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
+for (int i = 0; i &lt; 1000; ++i) tiny_kernel&lt;&lt;&lt;g, b, 0, s&gt;&gt;&gt;(d, N);
+cudaStreamEndCapture(s, &amp;graph);
+
+// 2) 编译为可执行图
+cudaGraphInstantiate(&amp;exec, graph, nullptr, nullptr, 0);
+
+// 3) 反复执行 (每次只 1 次 launch overhead)
+cudaGraphLaunch(exec, s);
+cudaStreamSynchronize(s);</code></pre>
+
+    <p>典型加速（见 <a href="../../code/ch08_async/cuda_graph_demo.cu">cuda_graph_demo.cu</a>）：1000 次小 kernel 从 ~8 ms 降到 ~2 ms。</p>
+
+    <div class="callout">
+      <strong>📚 工业实践</strong>：vLLM 和 TensorRT-LLM 都用 CUDA Graphs 包裹"单步 decoding"——固定 batch、固定 seq len bucket、固定 layer，把每步内的几十次 kernel 录成一张图。
+    </div>
+
+    <h2>8.6 自检</h2>
+    <details><summary>Q1: 为什么 H2D 用 pageable 不能异步？</summary><p>CUDA 必须先确保 host 内存不被 OS 换出。pageable 时 driver 要 stage 复制一次，过程同步。pinned 内存本身锁定，DMA 直接读取。</p></details>
+    <details><summary>Q2: 多 stream 一定加速吗？</summary><p>不一定。如果 kernel 长 → H2D 短，重叠收益小。如果 GPU 已经 100% busy，开更多 stream 反而轮流抢占。Nsight Systems 看 timeline 才能确认。</p></details>
+    <details><summary>Q3: CUDA Graph 适合哪类工作负载？</summary><p>① 重复执行 ② 形状/参数不变 ③ kernel 很小很多。LLM decoding 完美命中。训练时形状变化大，graph 收益小。</p></details>
+    <details><summary>Q4: 同一 stream 上的 kernel 会并发吗？</summary><p>不会。同 stream 严格 FIFO。要并发必须开多 stream + 显式无依赖。</p></details>
+    <details><summary>Q5: <code>cudaEventRecord</code> 在 stream 上等什么？</summary><p>等该 stream 上 event 之前的所有命令完成。配 cudaEventSynchronize 或 cudaStreamWaitEvent 可做 stream-to-stream 同步（不需要 host 参与）。</p></details>
+
+    <h2>8.7 练习</h2>
+    <ol>
+      <li>用 <code>nsys profile</code> 跑 <code>multi_stream.cu</code>，截图 timeline，标出 H2D / kernel / D2H 的重叠区。</li>
+      <li>把 <code>cuda_graph_demo.cu</code> 改成 capture 一个"矩阵乘 → softmax → 矩阵乘"序列（用前面章节的 kernel）。</li>
+      <li>用 ncu 跑 Ch6 的 <code>matmul_tiled</code>，记录 Achieved Occupancy 和 L1 Hit Rate。</li>
+      <li>给 <code>vec_add</code>（Ch3）改成 4 stream 版本，比对加速比。</li>
+    </ol>
+
+    <h2 id="industry">8.8 工业实战：Nsight 工作流、流优先级、生产 profile 套路</h2>
+
+    <h3>8.8.1 Nsight Systems：第一步永远是看 timeline</h3>
+
+    <p>定位性能问题的<strong>正确顺序</strong>是 "先大后小"：先用 nsys 看整体 timeline 是否有 GPU idle gap、CPU 阻塞、stream 是否 overlap，再用 ncu 钻具体 kernel。新手通常上来就用 ncu 调单 kernel，结果发现整体瓶颈不在那个 kernel。</p>
+
+<pre><code class="language-bash"># 1) 录制 timeline (限制时长避免文件过大)
+nsys profile \
+    --trace=cuda,nvtx,osrt,cudnn,cublas \
+    --duration=10 \
+    --force-overwrite=true \
+    -o report.nsys-rep \
+    ./my_llm_server
+
+# 2) 命令行看 summary
+nsys stats report.nsys-rep
+# 关注 "CUDA Kernel Statistics" 表 — 哪个 kernel 占时间最多
+
+# 3) GUI 看 timeline (本地 Mac/Win 用 Nsight Systems Desktop 打开)
+# 关键视角:
+#  - GPU 行: 看 kernel 之间有没有 gap (= idle)
+#  - CUDA HW row: H2D/D2H 跟 kernel 是否 overlap
+#  - CPU 行: 主线程是否被 cudaMemcpy 阻塞 (说明没用 pinned + async)</code></pre>
+
+    <h3>8.8.2 NVTX 注解 — 让 timeline 可读</h3>
+
+    <p>不打 NVTX 标记，timeline 上一堆 mykernel_v2 / mykernel_v3 完全看不出哪是 attention、哪是 MLP。生产代码<strong>必须</strong>在每个逻辑段加 NVTX range：</p>
+
+<pre><code class="language-cpp">#include &lt;nvtx3/nvToolsExt.h&gt;
+
+void forward(...) {
+    nvtxRangePushA("layer_0");
+    {
+        nvtxRangePushA("attention");
+        nvtxRangePushA("qkv_proj");   qkv_proj_kernel(...);   nvtxRangePop();
+        nvtxRangePushA("flash_attn"); flash_attn_kernel(...); nvtxRangePop();
+        nvtxRangePushA("out_proj");   out_proj_kernel(...);   nvtxRangePop();
+        nvtxRangePop();  // attention
+        nvtxRangePushA("mlp"); /* ... */ nvtxRangePop();
+    }
+    nvtxRangePop();  // layer_0
+}</code></pre>
+
+    <p>PyTorch 已经把 NVTX 集成进 <code>torch.profiler</code>，会自动给每个 op 加标记。</p>
+
+    <h3>8.8.3 Nsight Compute：钻进单 kernel</h3>
+
+    <p>找到瓶颈 kernel 后用 ncu 看为什么慢。<strong>关键 set：</strong></p>
+
+<pre><code class="language-bash"># 完整指标 (最慢, 但信息最全, 一次抓清)
+ncu --set full --target-processes all -o report.ncu-rep ./app
+
+# 只抓特定 kernel (按名字匹配)
+ncu --set full --kernel-name regex:".*flash_attn.*" -o fa.ncu-rep ./app
+
+# 仅看 roofline + memory
+ncu --section MemoryWorkloadAnalysis --section SpeedOfLight ./app
+
+# 一次只跑 N 次 (避免长 trace)
+ncu --launch-count 1 --launch-skip 100 ./app</code></pre>
+
+    <p>用 Nsight Compute UI 打开 .ncu-rep 文件，<strong>先看 "Speed Of Light" 节</strong>——两个百分比：</p>
+    <ul>
+      <li><strong>SM %</strong> = 算力利用率。低 → compute-bound 失败 / 寄存器spill / divergence</li>
+      <li><strong>Memory %</strong> = HBM 带宽利用率。低 → 访存模式差 / cache miss / 算术强度低</li>
+      <li>两者都低（&lt; 30%）→ kernel 在等同步、stream serialization、launch 开销过大</li>
+    </ul>
+
+    <h3>8.8.4 必看的 10 个 ncu 指标</h3>
+
+    <table>
+      <tr><th>指标</th><th>含义</th><th>正常区间</th><th>异常含义</th></tr>
+      <tr><td>sm__throughput.avg.pct_of_peak_sustained_elapsed</td><td>SM 利用率</td><td>&gt;70% (compute-bound) 或 &lt;30% (mem-bound)</td><td>中间值最可疑</td></tr>
+      <tr><td>dram__throughput.avg.pct_of_peak_sustained_elapsed</td><td>HBM 利用率</td><td>&gt;80% mem-bound kernel 期望</td><td>&lt;30% + 期望 mem-bound = coalescing 差</td></tr>
+      <tr><td>smsp__sass_thread_inst_executed_op_fadd_pred_on...</td><td>fp32 指令吞吐</td><td>—</td><td>跟期望 GFLOPS 对照</td></tr>
+      <tr><td>sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed</td><td>Tensor Core 活跃%</td><td>&gt;50% for fp16 GEMM</td><td>0 → 没触发 TC</td></tr>
+      <tr><td>l1tex__data_bank_conflicts_pipe_lsu_mem_shared</td><td>shared bank conflict 计数</td><td>0</td><td>非 0 → 加 padding 或 swizzle</td></tr>
+      <tr><td>smsp__warps_active.avg.per_cycle_active</td><td>平均活跃 warp / SM</td><td>vs max 比例 = achieved occupancy</td><td>低 → block 太小或资源占用高</td></tr>
+      <tr><td>smsp__warp_issue_stalled_long_scoreboard_per_warp_active</td><td>等内存 stall</td><td>—</td><td>高 → 内存 bound</td></tr>
+      <tr><td>smsp__warp_issue_stalled_math_pipe_throttle...</td><td>算力单元 throttle</td><td>—</td><td>高 → compute bound</td></tr>
+      <tr><td>launch__registers_per_thread</td><td>每 thread 寄存器</td><td>&lt; 96 健康</td><td>&gt; 128 可能 spill</td></tr>
+      <tr><td>memory_l2_hit_rate</td><td>L2 命中率</td><td>&gt;50% 好</td><td>低 → working set 超 L2</td></tr>
+    </table>
+
+    <h3>8.8.5 PyTorch / Python 侧的 profile</h3>
+
+    <p>不是所有人都写裸 CUDA。LLM 工程师常用 PyTorch profiler：</p>
+
+<pre><code class="language-python">import torch
+from torch.profiler import profile, schedule, tensorboard_trace_handler
+
+with profile(
+    activities=[torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA],
+    schedule=schedule(wait=1, warmup=2, active=3),
+    on_trace_ready=tensorboard_trace_handler('./log'),
+    record_shapes=True,
+    with_stack=True,
+) as prof:
+    for step in range(10):
+        model(inputs)
+        prof.step()
+
+# 跑完用 tensorboard 看, 或者 chrome://tracing 打开 .json</code></pre>
+
+    <h3>8.8.6 流优先级 — 让推理请求插队</h3>
+
+    <p>多请求并发推理时，<strong>新来的低延迟请求</strong>应该比"大 batch background 任务"优先。CUDA stream 支持优先级：</p>
+
+<pre><code class="language-cpp">int low, high;
+cudaDeviceGetStreamPriorityRange(&amp;low, &amp;high);
+// low = 0, high = -1 (典型, 越小越高优先级, 看你 GPU)
+
+cudaStream_t s_high, s_low;
+cudaStreamCreateWithPriority(&amp;s_high, cudaStreamNonBlocking, high);
+cudaStreamCreateWithPriority(&amp;s_low,  cudaStreamNonBlocking, low);
+
+// 新来的 prompt 走 s_high, 大 batch 走 s_low
+// 硬件调度器在 SM 上抢占 (会 preempt 当前 block 边界)</code></pre>
+
+    <p>典型应用：vLLM 实现"chat 优先于 batch"调度，TensorRT-LLM 把 prefill 与 decode 放不同优先级。</p>
+
+    <h3>8.8.7 production profile 工作流</h3>
+
+    <ol>
+      <li><strong>定位</strong>：nsys 录 timeline → 看 stats 找耗时 top kernel</li>
+      <li><strong>分析</strong>：ncu --set full 抓 top kernel → 看 SoL 百分比定性是 compute / memory / latency bound</li>
+      <li><strong>对症</strong>：
+        <ul>
+          <li>compute-bound → 换 Tensor Core / 提高 ILP / 减 divergence</li>
+          <li>memory-bound → coalesce / tile / 量化降位宽</li>
+          <li>latency-bound (两者都低) → 检查 occupancy, launch 频率, sync 次数</li>
+        </ul>
+      </li>
+      <li><strong>验证</strong>：再录 nsys 对比 timeline 是否变窄</li>
+      <li><strong>回归</strong>：把改动放进 CI 性能门禁（防止后续 commit 反向优化）</li>
+    </ol>
+
+    <p><strong>常见误区</strong>：</p>
+    <ul>
+      <li>只看一个 size 的 benchmark → 改完发现其他 size 性能反退（CUTLASS autotune 就在防这个）</li>
+      <li>没 warmup 第一次 timing → 包含 CUDA context init、cuBLAS 加载、Tensor Core 预热</li>
+      <li>用 <code>std::chrono</code> 测 GPU 时间 → 没 sync 时返回的是 launch 时间不是 kernel 时间</li>
+    </ul>
+
+    <h2 id="frontier">8.9 研究前沿（2025-2026）：CUDA Graph 进化与新 profile 工具</h2>
+
+    <h3>8.9.1 CUDA Graph 条件节点（Conditional Nodes，CUDA 12.4+）</h3>
+
+    <p>原始 CUDA Graph 是<strong>静态</strong>的：capture 时怎样，重放就怎样。LLM 推理里"循环到 EOS 才停"这种动态控制流没法 capture 到一张 graph 里——只能展开成 max_tokens 张 graph 或者分多次 launch。</p>
+
+    <p>CUDA 12.4 引入 <strong>conditional graph nodes</strong>：</p>
+<pre><code class="language-cpp">cudaGraphConditionalHandle handle;
+cudaGraphConditionalHandleCreate(&amp;handle, graph, /*default=*/0, 0);
+
+// 添加一个 "while (handle != 0)" 节点
+cudaGraphNode_t while_node;
+cudaGraphNodeParams params = {};
+params.type = cudaGraphNodeTypeConditional;
+params.conditional.handle = handle;
+params.conditional.type   = cudaGraphCondTypeWhile;
+params.conditional.size   = 1;
+cudaGraphAddNode(&amp;while_node, graph, deps, n_deps, &amp;params);
+
+// 在循环 body kernel 里更新 handle:
+__device__ void check_eos(int token, cudaGraphConditionalHandle h) {
+    if (token == EOS_ID) cudaGraphSetConditional(h, 0);   // 退出循环
+    else                 cudaGraphSetConditional(h, 1);
+}</code></pre>
+
+    <p>意义：<strong>一次 launch 能跑完整个生成过程</strong>，包括动态停止判断。vLLM 0.6+ 和 TRT-LLM 已在用，端到端延迟 -20-40%。</p>
+
+    <h3>8.9.2 Nsight Compute 2025 — fp4 / fp8 Roofline 支持</h3>
+
+    <p>2025 版 Nsight Compute 关键更新：</p>
+    <ul>
+      <li>fp8 / fp4 算力作为独立 roofline 轴（之前只有 fp16/fp32）</li>
+      <li>TMEM occupancy 指标（Blackwell）</li>
+      <li>wgmma / TCGEN05 流水利用率细分</li>
+      <li><strong>Auto-tuning advisor</strong>：分析后给出"改 tile / 改 launch_bounds / 加 cp.async" 等具体建议</li>
+      <li>SQLite report 格式（之前是 protobuf），方便用 Python 自动分析</li>
+    </ul>
+
+    <h3>8.9.3 PyTorch Profiler + Holistic Trace Analysis</h3>
+
+    <p>Meta 开源 <strong>HTA (Holistic Trace Analysis)</strong> 把 PyTorch profiler trace 自动化分析：</p>
+<pre><code class="language-python">from hta.trace_analysis import TraceAnalysis
+ta = TraceAnalysis(trace_dir="./logs")
+ta.get_temporal_breakdown()        # GPU compute / comm / idle 占比
+ta.get_gpu_kernel_breakdown()      # 单 kernel top
+ta.get_communication_comp_overlap()# NCCL 是否跟 compute overlap
+ta.get_idle_time_breakdown()       # SM idle 是因为什么 stall</code></pre>
+
+    <p>对大规模训练 / 推理服务来说，能省下手工看 timeline 几小时的工作。</p>
+
+    <h3>8.9.4 持久化 kernel + CUDA Graph 混合模式</h3>
+
+    <p>vLLM、TRT-LLM、SGLang 在 2024-2025 大量采用的模式：</p>
+
+<pre class="mermaid">
+graph LR
+    A["请求队列"] --> B["Scheduler<br/>(host)"]
+    B --> C["Persistent kernel<br/>常驻全部 SM"]
+    B --> D["CUDA Graph cache<br/>各 batch_size 一份"]
+    C --> E["attention / fused 算子"]
+    D --> F["batch=1, 2, 4, 8, 16, 32"]
+    style C fill:#f6f8fa,stroke:#0969da
+    style D fill:#f6f8fa,stroke:#1a7f37
+</pre>
+
+    <ul>
+      <li><strong>Persistent kernel</strong> 永远在线，从 host 的 work queue 拉任务（用于动态调度的 attention / sampling）</li>
+      <li><strong>CUDA Graph</strong> 预 capture 各 bucket 的"标准 decode 一步" </li>
+      <li>scheduler 每步选 batch_size bucket → launch 对应 graph</li>
+      <li>graph 内部参数（KV 位置、当前 token）用 <code>cudaGraphExecKernelNodeSetParams</code> 动态更新</li>
+    </ul>
+
+    <p>实测端到端：纯 CUDA Graph 帮你省 ~30% latency；持久化 kernel 再省 ~10%；两者组合是 SOTA。</p>
+
+    <h3>8.9.5 NVSHMEM / 多 GPU 异步通信</h3>
+
+    <p>NCCL 之外的 2024-2026 新选择：<strong>NVSHMEM</strong>（NVIDIA 推的 PGAS 风格库），让 kernel 内直接 <code>put / get</code> 跨 GPU 内存，跟 NVLink 硬件深度绑定：</p>
+<pre><code class="language-cpp">__global__ void cross_gpu_attn(...) {
+    /* compute local */
+    nvshmem_putmem_block(remote_addr, local_addr, bytes, peer_pe);
+    nvshmem_barrier_all();
+    /* compute global */
+}</code></pre>
+
+    <p>比 NCCL 集合通信粒度更细，对 <strong>Ring Attention / Stripe Attention / Expert Parallel</strong> 等"边算边通信"模式收益大。TensorRT-LLM 长 context 推理已在用。</p>
+
+    <h3>8.9.6 端到端性能调优新范式</h3>
+
+    <p>2025 的"性能调优"已经从"调单 kernel" 转向<strong>"端到端 trace 驱动"</strong>：</p>
+    <ol>
+      <li>跑 nsys + HTA 录 timeline 跨 GPU / CPU / 通信</li>
+      <li>找<strong>关键路径</strong>（critical path）—— 通常是某 GPU 的 kernel + NCCL 阻塞</li>
+      <li>优化关键路径上的 1-2 个 kernel（用 ncu 钻），其他保持现状</li>
+      <li>验证 timeline 是否被压缩</li>
+    </ol>
+
+    <p>关键 KPI：单 GPU 不是 throughput 而是<strong>"在关键路径上的占比"</strong>。这是大规模分布式训练 / 推理性能工程的工作模式。</p>
+
+    <h2>8.10 常见坑</h2>
+    <ul>
+      <li>用 pageable host 内存做 async memcpy → 实际是同步，看 nsys 才发现重叠"消失"</li>
+      <li>graph capture 时 kernel 参数指针不能改 → 改了需要 <code>cudaGraphExecUpdate</code></li>
+      <li>多 stream 共享同一 device buffer 又不加事件同步 → race</li>
+    </ul>
+
+    <p>到此<strong>阶段 B 结束</strong>。你已经具备了写高性能 kernel 的全部工具。下一章我们用这些工具一气呵成把 GEMM 推到接近硬件极限。</p>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch07-reduce/index.html"><span class="label">上一章</span>← 07 · Reduce</a>
+      <a class="next" href="../ch09-gemm/index.html"><span class="label">下一章</span>09 · GEMM 深入 →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body></html>

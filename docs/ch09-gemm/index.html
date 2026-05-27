@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 9 章 · GEMM 深入</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head><body>
+<div id="layout">
+  <aside id="sidebar">
+    <h1><a href="../index.html">CUDA × LLM 教程</a></h1>
+    <nav>
+      <div class="stage">A · 基础</div>
+      <ol><li><a href="../ch01-intro/index.html">导论与环境</a></li><li><a href="../ch02-hello/index.html">Hello CUDA</a></li><li><a href="../ch03-threads/index.html">线程模型与索引</a></li><li><a href="../ch04-arch/index.html">GPU 硬件架构</a></li></ol>
+      <div class="stage">B · 核心</div>
+      <ol start="5"><li><a href="../ch05-memory/index.html">内存层级</a></li><li><a href="../ch06-tile/index.html">Shared Memory & Tile</a></li><li><a href="../ch07-reduce/index.html">Reduction & Scan</a></li><li><a href="../ch08-async/index.html">性能分析与异步</a></li></ol>
+      <div class="stage">C · LLM</div>
+      <ol start="9"><li><a href="../ch09-gemm/index.html" class="current">GEMM 深入</a></li><li><a href="../ch10-softmax/index.html">Softmax & Norm</a></li><li><a href="../ch11-attention/index.html">Attention 入门</a></li><li><a href="../ch12-flashattn/index.html">FlashAttention</a></li><li><a href="../ch13-llm-parts/index.html">LLM 必备零件</a></li><li><a href="../ch14-mini-llm/index.html">Capstone Mini-LLM</a></li></ol>
+      <div class="stage">附录</div><ol style="counter-reset: ch -1"><li style="list-style:none"><a href="../glossary.html">📖 术语表</a></li></ol>
+    </nav>
+  </aside>
+
+  <main>
+    <h1>第 9 章 · GEMM 深入</h1>
+    <div class="chapter-meta"><span>⏱️ 90 分钟</span><span>🎯 触摸 Tensor Core</span><span>📂 code/ch09_gemm/</span><span>🔥 关键瓶颈章</span></div>
+
+    <h2>学习目标</h2>
+    <ul>
+      <li>把 Ch6 tiled matmul 推进到 <strong>2D 寄存器 tile</strong>，性能再翻 2-3 倍</li>
+      <li>第一次摸 <strong>Tensor Core</strong>（WMMA API），看到 fp16 算力如何碾压 fp32</li>
+      <li>对比 cuBLAS baseline，知道还差多少、差在哪</li>
+      <li>了解 CUTLASS / CuTe 与"手写到极致"的关系</li>
+    </ul>
+
+    <h2>9.1 GEMM 在 LLM 里的地位</h2>
+    <p>统计：LLM 推理 80%+ 的 FLOPs 在 GEMM 上。Transformer 每层主要算子：</p>
+    <ul>
+      <li>QKV projection：<code>X (T, D) @ W_qkv (D, 3D) → (T, 3D)</code></li>
+      <li>Attention output：<code>(T, D) @ W_o (D, D)</code></li>
+      <li>MLP up/down：<code>(T, D) @ W_up (D, 4D) → (T, 4D)</code>，再 <code>(T, 4D) @ W_down (4D, D)</code></li>
+    </ul>
+    <p>所以 GEMM 快 1×，整个推理快 80%。这就是为什么 NVIDIA 把"Tensor Core"做到第 5 代。</p>
+
+    <h2 id="reg-tile">9.2 寄存器 Tile：从 Ch6 再进一步</h2>
+    <p>Ch6 里每 thread 算 1 个 cell。瓶颈是<strong>每读 As/Bs 一次只用 2 个 FLOP</strong>。
+       如果每 thread 算 8×8 = 64 个 cell：每读 8+8 个 shared 值就做 64 个 FLOP，shared 访问减少 8×。</p>
+
+<pre class="mermaid">
+graph TD
+    A["block 处理 C 的 128×128 tile<br/>thread block = 16×16 = 256 threads"]
+    A --> B["每 thread 持有 8×8 reg accumulator"]
+    B --> C["K 维分 BK=16 切片<br/>每片协作加载 128×16 + 16×128 到 shared"]
+    C --> D["内层 K 循环 (BK=16):<br/>读 8 个 As 行 + 8 个 Bs 列 → 64 个 fmadd"]
+    D --> E["写回 C"]
+    style B fill:#f6f8fa,stroke:#1a7f37
+    style D fill:#f6f8fa,stroke:#bf8700
+</pre>
+
+<pre><code class="language-cpp">constexpr int BM = 128, BN = 128, BK = 16;
+constexpr int TM = 8,   TN = 8;
+
+__global__ void gemm_reg_tile(const float* A, const float* B, float* C, int M, int N, int K) {
+    __shared__ float As[BM][BK], Bs[BK][BN];
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int row0 = blockIdx.y * BM + ty * TM;
+    int col0 = blockIdx.x * BN + tx * TN;
+    float acc[TM][TN] = {0};
+
+    for (int kt = 0; kt &lt; K; kt += BK) {
+        /* 协作 load A 的 128x16 + B 的 16x128 (每 thread load 8+8 个数) */
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k &lt; BK; ++k) {
+            float a_reg[TM], b_reg[TN];
+            #pragma unroll for (int i=0;i&lt;TM;++i) a_reg[i] = As[ty*TM+i][k];
+            #pragma unroll for (int j=0;j&lt;TN;++j) b_reg[j] = Bs[k][tx*TN+j];
+            #pragma unroll for (int i=0;i&lt;TM;++i)
+            #pragma unroll for (int j=0;j&lt;TN;++j) acc[i][j] += a_reg[i] * b_reg[j];
+        }
+        __syncthreads();
+    }
+    /* write back acc → C */
+}</code></pre>
+
+    <p>关键洞察：内层 8×8 = 64 个 fmadd 全部在<strong>寄存器</strong>之间发生。BK=16 步内只触发 16×(8+8) = 256 次 shared load，每 thread 做 16×64 = 1024 个 FLOP。算术强度 4 FLOP/shared-byte。</p>
+
+    <h2 id="wmma">9.3 Tensor Core — WMMA API</h2>
+    <p>fp32 CUDA core 路线最多到 ~10 TFLOPS（A100）。要继续上 30+ TFLOPS 必须用 Tensor Core——它是专门做 16×16×16 fp16 矩阵乘加的硬件。</p>
+
+    <h3>WMMA fragment 三件套</h3>
+<pre><code class="language-cpp">#include &lt;mma.h&gt;
+using namespace nvcuda;
+
+wmma::fragment&lt;wmma::matrix_a, 16, 16, 16, __half, wmma::row_major&gt; a_frag;
+wmma::fragment&lt;wmma::matrix_b, 16, 16, 16, __half, wmma::row_major&gt; b_frag;
+wmma::fragment&lt;wmma::accumulator, 16, 16, 16, float&gt;                c_frag;
+
+wmma::fill_fragment(c_frag, 0.f);
+for (int kt = 0; kt &lt; K; kt += 16) {
+    wmma::load_matrix_sync(a_frag, A + row*K + kt, K);
+    wmma::load_matrix_sync(b_frag, B + kt*N + col, N);
+    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);   // <-- TC magic
+}
+wmma::store_matrix_sync(C + row*N + col, c_frag, N, wmma::mem_row_major);</code></pre>
+
+    <p>每个 warp 共享一个 fragment，硬件保证<strong>整个 warp 32 个 lane 协作完成 16×16×16 = 4096 FMA</strong>，一次 mma_sync 指令吞 8 个时钟。</p>
+
+    <div class="callout warn">
+      <strong>限制：</strong> 仅 sm_70+；M/N/K 通常要 16 倍数；fp16 输入精度有限（fp32 累加缓解，但仍不如纯 fp32）。
+      实际应用通常配 <strong>per-channel scaling</strong> + <strong>loss scaling</strong> 防止下溢。
+    </div>
+
+    <h2 id="baseline">9.4 cuBLAS baseline</h2>
+    <p>调 cuBLAS 是判断"自己写得好不好"的标尺：</p>
+<pre><code class="language-cpp">#include &lt;cublas_v2.h&gt;
+cublasHandle_t h; cublasCreate(&amp;h);
+float alpha = 1.f, beta = 0.f;
+
+// 注意：cuBLAS 是 column-major！
+// row-major C(M,N) = A(M,K) @ B(K,N)
+//   ≡  C^T(N,M) = B^T(N,K) @ A^T(K,M)
+//   ≡  cublasSgemm(N, N, N, M, K, B, N, A, K, C, N)
+cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+            &amp;alpha, dB, N, dA, K, &amp;beta, dC, N);</code></pre>
+
+    <h2 id="bench">9.5 性能榜单（A100，1024³ MatMul）</h2>
+    <table>
+      <tr><th>实现</th><th>精度</th><th>GFLOPS</th><th>% of peak</th></tr>
+      <tr><td>Ch6 tiled (32×32)</td><td>fp32</td><td>~1800</td><td>9%</td></tr>
+      <tr><td>Ch9 register tile (128×128, 8×8)</td><td>fp32</td><td>~7000-9000</td><td>40-50%</td></tr>
+      <tr><td>cuBLAS sgemm</td><td>fp32</td><td>~16000</td><td>82%</td></tr>
+      <tr><td>本章 WMMA fp16</td><td>fp16</td><td>~50000-80000</td><td>20-30% (of 312 TF)</td></tr>
+      <tr><td>cuBLAS gemmEx fp16 + TC</td><td>fp16</td><td>~250000+</td><td>80%+</td></tr>
+      <tr><td>CUTLASS fp16 + TC</td><td>fp16</td><td>~280000+</td><td>90%+</td></tr>
+    </table>
+    <p>本章手写 WMMA 还有大量优化空间（async copy、swizzle、warpgroup mma）——但拿到 ~30% peak 已经是用 100 行代码做到的，足以理解原理。</p>
+
+    <h2>9.6 下一步技术（不在本章实现，但要知道存在）</h2>
+    <ul>
+      <li><strong><code>cp.async</code></strong>（sm_80+）：异步 global → shared，让 mainloop 拷贝与计算重叠</li>
+      <li><strong>Double / multi-stage buffer</strong>：2-4 块 shared 轮转，吞下 HBM 延迟</li>
+      <li><strong>swizzle layout</strong>：让 shared 读写避免 bank conflict 同时支持 TC 对齐</li>
+      <li><strong>mma.sync PTX</strong>（sm_80+）：比 WMMA 更细粒度，CUTLASS / FlashAttention 都用</li>
+      <li><strong>warpgroup MMA</strong>（sm_90+）：H100 的 wgmma，128 thread 协作大 tile</li>
+      <li><strong>TMA</strong>（sm_90+）：硬件 tensor 加载，不再写 load 循环</li>
+    </ul>
+
+    <h2>9.7 自检</h2>
+    <details><summary>Q1: register tile 越大越好吗？</summary><p>不是。每 thread 寄存器有 255 上限，TM=TN=16 就用了 256 个累加寄存器，spill 到 local memory 反而慢。</p></details>
+    <details><summary>Q2: 为什么 WMMA 用 fp32 accumulator？</summary><p>fp16 累加范围太窄（mantissa 仅 10 bit），长 K 的求和会下溢/上溢。fp32 累加保持精度，最后才转 fp16 输出。</p></details>
+    <details><summary>Q3: GEMM 在 M=1 (batch=1 decode) 时性能为啥差？</summary><p>1×K @ K×N = GEMV，瓶颈是带宽不是算力，Tensor Core 完全用不上。所以 LLM decode 阶段是 memory-bound。第 13 章会讲量化怎么救它。</p></details>
+    <details><summary>Q4: CUTLASS 是什么？</summary><p>NVIDIA 开源的 C++ GEMM 模板库，把 tile size / warp 切分 / async copy 都抽象成 type traits。生产 GEMM 几乎都用 CUTLASS 或它的 DSL (CuTe)。第 12 章 FlashAttention 也是基于 CUTLASS 写的。</p></details>
+    <details><summary>Q5: Triton 是什么？</summary><p>OpenAI 的 Python-like GPU DSL，编译到 PTX。比 CUDA 易写、性能接近 CUTLASS，vLLM 大量算子用 Triton 写。</p></details>
+
+    <h2>9.8 练习</h2>
+    <ol>
+      <li>给 <code>gemm_reg_tile</code> 加 double buffer（开两块 shared，K-loop 中 prefetch 下一片）。</li>
+      <li>用 <code>__pipeline_memcpy_async</code>（sm_80+）替换 shared 加载，看 GFLOPS 提升。</li>
+      <li>把 WMMA 改成支持 <code>bf16</code>（把 <code>__half</code> 换成 <code>__nv_bfloat16</code>）。</li>
+      <li>用 ncu 看 <code>gemm_wmma</code> 的 Tensor Active %，如果只有 30-50%，调整 block size 提到 70%+。</li>
+    </ol>
+
+    <h2 id="industry">9.9 工业实战：CUTLASS、低精度、autotune、生产 GEMM 决策树</h2>
+
+    <h3>9.9.1 CUTLASS — 不是库，是 GEMM 工厂</h3>
+
+    <p>cuBLAS 是闭源黑盒，你不能改 kernel 内部行为；CUTLASS 是 NVIDIA 开源的 C++ 模板库，把 GEMM 拆成可拼装的组件：</p>
+
+<pre><code class="language-cpp">// CUTLASS 3.x (CuTe DSL)
+#include &lt;cutlass/gemm/device/gemm_universal.h&gt;
+
+using Gemm = cutlass::gemm::device::GemmUniversal&lt;
+    cutlass::half_t, cutlass::layout::RowMajor,            // A: fp16 row-major
+    cutlass::half_t, cutlass::layout::ColumnMajor,         // B: fp16 col-major
+    cutlass::half_t, cutlass::layout::RowMajor,            // C: fp16 row-major
+    float,                                                  // accumulator: fp32
+    cutlass::arch::OpClassTensorOp,                        // Tensor Core
+    cutlass::arch::Sm80,                                   // A100
+    cutlass::gemm::GemmShape&lt;128, 256, 32&gt;,                // ThreadBlock tile
+    cutlass::gemm::GemmShape&lt;64, 64, 32&gt;,                  // Warp tile
+    cutlass::gemm::GemmShape&lt;16, 8, 16&gt;,                   // Instruction shape (mma.sync)
+    cutlass::epilogue::thread::LinearCombinationRelu&lt;...&gt;, // epilogue: out = relu(alpha*acc + beta*C)
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle&lt;&gt;,
+    3                                                       // pipeline stages (软流水深度)
+&gt;;
+
+Gemm gemm;
+gemm({M, N, K}, alpha, A, lda, B, ldb, beta, C, ldc, ...);</code></pre>
+
+    <p>看似冗长，但 5 行模板就拿到了 cuBLAS 90% 的性能。<strong>大公司生产代码大量基于 CUTLASS</strong>（TensorRT-LLM、FlashAttention、xformers）。</p>
+
+    <h3>CUTLASS profiler — 自动 autotune</h3>
+
+    <p>不知道你的 size 该选哪个 tile？跑 profiler：</p>
+<pre><code class="language-bash">cd cutlass/build
+./tools/profiler/cutlass_profiler \
+    --kernels=cutlass_tensorop_h16816gemm \
+    --m=4096 --n=4096 --k=4096 \
+    --A=f16:row --B=f16:col --C=f16 \
+    --accumulator-type=f32 \
+    --providers=cutlass,cublas
+
+# 输出: top 5 best-performing configurations</code></pre>
+
+    <h3>9.9.2 mma.sync vs WMMA：CUTLASS 用前者</h3>
+
+    <p>本章用了 WMMA API（<code>nvcuda::wmma</code>），它是 fragment 级抽象。CUTLASS 用更底层的 <code>mma.sync</code> PTX 指令：</p>
+
+    <table>
+      <tr><th></th><th>WMMA</th><th>mma.sync (PTX)</th></tr>
+      <tr><td>抽象层</td><td>fragment + load/mma/store</td><td>32 lane 的 inline ASM</td></tr>
+      <tr><td>shape 限制</td><td>固定 16×16×16, 16×8×8 等少数几种</td><td>所有硬件支持的 shape</td></tr>
+      <tr><td>fragment layout</td><td>opaque (不知道哪 lane 持有哪个值)</td><td>明确 (能跟 epilogue 配合)</td></tr>
+      <tr><td>性能</td><td>~70-80% peak</td><td>~90-95% peak</td></tr>
+      <tr><td>易写</td><td>容易</td><td>需要细心</td></tr>
+    </table>
+
+<pre><code class="language-cpp">// mma.sync 长这样 (Ampere fp16):
+asm volatile(
+    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+    "{%0,%1,%2,%3}, "                  // D (acc, 4 fp32)
+    "{%4,%5,%6,%7}, "                  // A (4 fp16x2)
+    "{%8,%9}, "                        // B (2 fp16x2)
+    "{%0,%1,%2,%3};\n"                 // C (= D in/out)
+    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+      "r"(b0), "r"(b1));</code></pre>
+
+    <p>普通工程师不需要直接写 mma.sync——CUTLASS 模板已封装。但读 FlashAttention v2 源码必看懂。</p>
+
+    <h3>9.9.3 低精度类型一览：fp16 / bf16 / tf32 / fp8 / int8 / int4</h3>
+
+    <table>
+      <tr><th>类型</th><th>位数</th><th>动态范围</th><th>典型用途</th><th>支持架构</th></tr>
+      <tr><td>fp32</td><td>1+8+23</td><td>±10⁻³⁸ 到 ±10³⁸</td><td>baseline</td><td>所有</td></tr>
+      <tr><td>tf32</td><td>1+8+10</td><td>同 fp32 但精度低</td><td>训练默认</td><td>sm_80+</td></tr>
+      <tr><td>fp16</td><td>1+5+10</td><td>±10⁻⁵ 到 ±10⁴ ⚠️ 易溢出</td><td>推理首选</td><td>sm_70+</td></tr>
+      <tr><td>bf16</td><td>1+8+7</td><td>同 fp32 但精度低</td><td>训练首选</td><td>sm_80+ (A100, H100)</td></tr>
+      <tr><td>fp8 E4M3</td><td>1+4+3</td><td>±0.0049 到 ±448</td><td>推理 (前向)</td><td>sm_89+ (Ada, H100)</td></tr>
+      <tr><td>fp8 E5M2</td><td>1+5+2</td><td>±10⁻⁵ 到 ±57344</td><td>训练 (反向)</td><td>sm_89+</td></tr>
+      <tr><td>int8</td><td>—</td><td>±127</td><td>推理量化</td><td>sm_75+</td></tr>
+      <tr><td>int4</td><td>—</td><td>±7</td><td>weight-only 量化</td><td>sm_80+</td></tr>
+      <tr><td>fp4 (B100)</td><td>—</td><td>±6</td><td>2025+ 推理</td><td>sm_100</td></tr>
+    </table>
+
+    <h3>fp16 vs bf16：选哪个？</h3>
+    <ul>
+      <li><strong>训练</strong>：用 bf16。同 fp32 的动态范围避免梯度下溢，需要的 loss scaling 少。</li>
+      <li><strong>推理</strong>：fp16 略快（编码精度高，TC 路径更成熟），但 bf16 更稳，新代码倾向 bf16。</li>
+      <li><strong>FlashAttention</strong>：fp16 / bf16 都支持，看模型权重类型。</li>
+    </ul>
+
+    <h3>fp8 — H100 的 LLM 杀手锏</h3>
+    <p>Llama 70B 用 fp8 推理（权重 + KV cache 都 fp8），相比 fp16：</p>
+    <ul>
+      <li>显存 / HBM 流量减半 → decode 速度 +80%</li>
+      <li>Tensor Core 算力翻倍 → prefill 速度 +80%</li>
+      <li>精度损失 &lt; 0.5 PPL（FP8-E4M3 + per-tensor scale）</li>
+    </ul>
+
+    <p>调用：</p>
+<pre><code class="language-cpp">cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
+             &amp;alpha,
+             dB_e4m3, CUDA_R_8F_E4M3, N,
+             dA_e4m3, CUDA_R_8F_E4M3, K,
+             &amp;beta,
+             dC_half, CUDA_R_16F, N,
+             CUBLAS_COMPUTE_32F,
+             CUBLAS_GEMM_DEFAULT);</code></pre>
+
+    <h3>9.9.4 production GEMM 决策树</h3>
+
+<pre class="mermaid">
+graph TD
+    Start["GEMM with M, N, K, dtype"] --> M1{"M 等于 1 ?"}
+    M1 -->|"是"| GEMV["走 GEMV kernel<br/>weight-only int4 量化"]
+    M1 -->|"否"| Size{"min of M N 小于 64 ?"}
+    Size -->|"是"| Thin["thin GEMM<br/>每 SM 算一行或一列"]
+    Size -->|"否"| K1{"K 大于 4 倍 min M N ?"}
+    K1 -->|"是"| StreamK["CUTLASS Stream-K"]
+    K1 -->|"否"| Dtype{"dtype 是 fp16 bf16 fp8 ?"}
+    Dtype -->|"是"| TC["cublasGemmEx + TC<br/>或 CUTLASS"]
+    Dtype -->|"否 fp32"| Sgemm["cublasSgemm"]
+    style GEMV fill:#f6f8fa,stroke:#bf8700
+    style TC fill:#f6f8fa,stroke:#1a7f37
+</pre>
+
+    <h3>9.9.5 LLM 各层 GEMM 的实际 shape</h3>
+
+    <p>Llama 7B (D=4096, n_head=32, d_head=128, d_ff=11008)，<strong>prefill 阶段 (T=2048, batch=1)</strong>：</p>
+    <table>
+      <tr><th>GEMM</th><th>M × N × K</th><th>FLOPs</th><th>类型</th></tr>
+      <tr><td>QKV projection</td><td>2048 × 12288 × 4096</td><td>0.2 TF</td><td>普通</td></tr>
+      <tr><td>Output projection</td><td>2048 × 4096 × 4096</td><td>0.07 TF</td><td>普通</td></tr>
+      <tr><td>FFN gate</td><td>2048 × 11008 × 4096</td><td>0.18 TF</td><td>普通</td></tr>
+      <tr><td>FFN up</td><td>同上</td><td>同上</td><td>普通</td></tr>
+      <tr><td>FFN down</td><td>2048 × 4096 × 11008</td><td>0.18 TF</td><td>普通</td></tr>
+      <tr><td>logits</td><td>2048 × 32000 × 4096</td><td>0.5 TF</td><td>普通但 N=32K 大</td></tr>
+    </table>
+
+    <p>同样模型 <strong>decode 阶段 (M=1)</strong>：所有 GEMM 都变 GEMV，FLOPs 减为 1/2048 但 HBM 流量不变 → 完全 memory-bound。</p>
+
+    <p>这就是 LLM 推理的<strong>"两个世界"</strong>：prefill 在 compute-bound，可以用大 batch + TC 充分利用算力；decode 在 memory-bound，只能靠量化 + KV cache 优化 + speculative decoding 救。</p>
+
+    <h2 id="frontier">9.10 研究前沿（2025-2026）：FP4 GEMM、DeepSeek 原生 FP8、CUTLASS 3.5</h2>
+
+    <h3>9.10.1 FP4 GEMM — Blackwell 的杀招</h3>
+
+    <p>2025 NVIDIA Blackwell 把"用 4-bit 浮点训练 / 推理"从研究变成产品。两种 fp4 微缩放格式：</p>
+
+    <table>
+      <tr><th>格式</th><th>编码</th><th>block scale</th><th>来源</th><th>用途</th></tr>
+      <tr><td><strong>NVFP4</strong> (E2M1)</td><td>1+2+1</td><td>fp8 (E4M3), block=16</td><td>NVIDIA 私有</td><td>推理首选，精度高</td></tr>
+      <tr><td><strong>MXFP4</strong> (E2M1)</td><td>1+2+1</td><td>E8M0, block=32</td><td>OCP 开放标准</td><td>跨厂商兼容</td></tr>
+      <tr><td><strong>MXFP6</strong> (E3M2/E2M3)</td><td>1+3+2 或 1+2+3</td><td>E8M0, block=32</td><td>OCP</td><td>激活用，比 fp4 稳</td></tr>
+    </table>
+
+    <h3>FP4 GEMM 调用（CUTLASS 3.5+）</h3>
+<pre><code class="language-cpp">using Gemm = cutlass::gemm::collective::CollectiveBuilder&lt;
+    cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
+    cutlass::nv_float4_t, cutlass::layout::RowMajor, 16,        // A: NVFP4, block 16
+    cutlass::nv_float4_t, cutlass::layout::ColumnMajor, 16,     // B: NVFP4
+    float, /*accumulator*/                                       // accumulator fp32
+    cutlass::gemm::collective::StageCount&lt;4&gt;,                    // 4-stage pipeline
+    ...
+&gt;::CollectiveOp;</code></pre>
+
+    <p>性能：B200 上 4096³ fp4 GEMM 跑到 ~6.5 PF（占 7.7 PF peak 的 85%）。相比 H100 fp16（~600 TF）<strong>提速 ~11×</strong>。LLM 推理 throughput 在 B200 上跟 H100 fp16 比典型 4-6×。</p>
+
+    <h3>9.10.2 DeepSeek-V3 原生 FP8 训练 — 验证可行性</h3>
+
+    <p>2024.12 DeepSeek-V3 发布，<strong>用 fp8 训练 671B MoE 模型成功</strong>，是产业第一个公开复现的案例。技术要点：</p>
+    <ul>
+      <li><strong>tile-wise 1×128 + block-wise 128×128 量化</strong>：activation per-token-per-tile, weight per-128-block；细粒度 scale 让精度损失 &lt; bf16 训练 1%</li>
+      <li><strong>fp32 accumulator + 周期性 promote to bf16</strong>：避免 fp8 累加器溢出</li>
+      <li><strong>关键算子（norm、softmax）保持 bf16</strong>：fp8 只用在 GEMM</li>
+      <li>训练成本：仅 ~558 万美元（H800 集群 2 个月），证明 fp8 路线经济可行</li>
+    </ul>
+
+    <p>开源 fp8 训练框架推荐：</p>
+    <ul>
+      <li><strong>TransformerEngine</strong>（NVIDIA）：Hopper+ 训练首选</li>
+      <li><strong>FBGEMM_GPU</strong>（Meta）：fp8 + 量化 GEMM</li>
+      <li><strong>vLLM W8A8 fp8</strong>：推理</li>
+      <li><strong>SGLang FP8</strong>：推理 + 训练混合</li>
+    </ul>
+
+    <h3>9.10.3 CUTLASS 3.5+ 与 CuTe DSL</h3>
+
+    <p>2024-2025 CUTLASS 3.5 重大改动：</p>
+    <ul>
+      <li>全面用 CuTe DSL（Layout-of-Tensor 代数）</li>
+      <li>原生支持 Blackwell TCGEN05 + TMEM</li>
+      <li>新加 collective builder：选好 (arch, dtype, layout) 就自动产出最优 kernel</li>
+      <li><strong>Python 绑定</strong>（cutlass.cpp.cute）逐步成熟，让原型阶段不再写 C++ 模板</li>
+    </ul>
+
+<pre><code class="language-python"># CUTLASS Python 调用 (2025+)
+import cutlass
+plan = cutlass.op.Gemm(element_a=cutlass.DataType.bf16,
+                       element_b=cutlass.DataType.bf16,
+                       element_c=cutlass.DataType.bf16,
+                       element_accumulator=cutlass.DataType.f32,
+                       layout=cutlass.LayoutType.RowMajor)
+plan.run(A, B, C, alpha=1.0, beta=0.0)        # 自动选最优 tile</code></pre>
+
+    <h3>9.10.4 W4A4 / W4A8KV4 — 极致量化推理（2024-2025）</h3>
+
+    <table>
+      <tr><th>方案</th><th>权重</th><th>激活</th><th>KV cache</th><th>典型加速</th></tr>
+      <tr><td>fp16 baseline</td><td>fp16</td><td>fp16</td><td>fp16</td><td>1×</td></tr>
+      <tr><td>W8A8 (SmoothQuant)</td><td>int8</td><td>int8</td><td>fp16</td><td>1.5-2×</td></tr>
+      <tr><td>W4A16 (GPTQ/AWQ)</td><td>int4</td><td>fp16</td><td>fp16</td><td>2-3× decode</td></tr>
+      <tr><td><strong>W4A8</strong> (QServe MIT, 2024)</td><td>int4</td><td>int8</td><td>int4</td><td>2.5× over W4A16</td></tr>
+      <tr><td><strong>W4A4</strong> (Atom, QuaRot 2024)</td><td>int4</td><td>int4</td><td>int4</td><td>~3-4×, 需精心实现</td></tr>
+      <tr><td><strong>NVFP4</strong> (Blackwell 2025)</td><td>fp4</td><td>fp4</td><td>fp8/fp4</td><td>~4-6×</td></tr>
+    </table>
+
+    <p>关键论文：</p>
+    <ul>
+      <li><strong>QServe</strong> (MIT, 2024)：W4A8KV4，serve 性能比 TensorRT-LLM W4A16 高 2-3×</li>
+      <li><strong>QuaRot</strong> (ICML 2024)：用 Hadamard 旋转把激活的 outlier 平摊，支持 W4A4 几乎无损</li>
+      <li><strong>SmoothQuant</strong>（2022 老经典）：活了 4 年仍是 W8A8 默认</li>
+      <li><strong>FP8 vs INT8</strong>（2024 多篇）：结论是 fp8 精度略高、HW 支持更好，<strong>新硬件优先 fp8</strong></li>
+    </ul>
+
+    <h3>9.10.5 训练 GEMM 的新范式：Microscaling + Transformer Engine 2</h3>
+
+    <p>Hopper 上的 fp8 训练已经稳定（NVIDIA TE 1）。Blackwell 把它升级到<strong>动态精度训练</strong>：</p>
+    <ul>
+      <li>每层 forward / backward<strong>自动选 fp4 / fp6 / fp8</strong></li>
+      <li>梯度小的用 fp4，大的用 fp8</li>
+      <li>关键 norm / softmax 自动 fall back bf16</li>
+      <li>训练吞吐 vs Hopper fp8 baseline：B200 上典型 3-4× 加速</li>
+    </ul>
+
+    <h3>9.10.6 工业 GEMM 库格局（2026）</h3>
+
+    <table>
+      <tr><th>库</th><th>定位</th><th>覆盖</th></tr>
+      <tr><td><strong>cuBLAS / cuBLASLt</strong></td><td>NVIDIA 标配, 闭源黑盒</td><td>全精度, 全架构</td></tr>
+      <tr><td><strong>CUTLASS 3.5+</strong></td><td>开源模板, fused epilogue</td><td>Hopper+Blackwell 完整</td></tr>
+      <tr><td><strong>TensorRT-LLM kernels</strong></td><td>推理 fused (qkv+norm+attention+output)</td><td>Hopper+Blackwell</td></tr>
+      <tr><td><strong>ThunderKittens</strong></td><td>极简研究 DSL</td><td>Hopper+ (Blackwell 适配中)</td></tr>
+      <tr><td><strong>FlashInfer</strong></td><td>专注 attention 各变体</td><td>多平台</td></tr>
+      <tr><td><strong>Triton</strong></td><td>Python kernel, vLLM/SGLang 用</td><td>Ampere-Blackwell</td></tr>
+      <tr><td><strong>Marlin / Machete</strong></td><td>W4A16 极致 kernel</td><td>Ampere+</td></tr>
+      <tr><td><strong>FBGEMM_GPU</strong> (Meta)</td><td>fp8 + 量化推理</td><td>Hopper+</td></tr>
+    </table>
+
+    <h2>9.11 常见坑</h2>
+    <ul>
+      <li>cuBLAS row/col-major 算错 → 结果是 C^T，调试一上午才发现</li>
+      <li>WMMA 的 M/N/K 不是 16 倍数 → 编译能过运行结果 0</li>
+      <li>fp16 输入没归一化 → 大量上溢，c_frag 直接 inf/nan</li>
+      <li>shared mem 太大 (BM=BN=256) → kernel launch failed (resource exceeded)</li>
+    </ul>
+
+    <nav class="chapter-nav">
+      <a class="prev" href="../ch08-async/index.html"><span class="label">上一章</span>← 08 · Async</a>
+      <a class="next" href="../ch10-softmax/index.html"><span class="label">下一章</span>10 · Softmax & Norm →</a>
+    </nav>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.6.1/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-cpp.min.js"></script>
+<script src="../assets/tutorial.js"></script>
+</body></html>
