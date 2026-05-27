@@ -41,8 +41,8 @@ graph LR
     B -->|"高"| C["Compute-bound<br/>瓶颈在算力"]
     M --> M1["优化方向:<br/>coalescing<br/>shared mem 复用<br/>量化降位宽"]
     C --> C1["优化方向:<br/>Tensor Core<br/>算子融合<br/>增大 batch"]
-    style M fill:#f6f8fa,stroke:#bf8700
-    style C fill:#f6f8fa,stroke:#1a7f37
+    style M fill:#f3f1e8,stroke:#a86420
+    style C fill:#f3f1e8,stroke:#2f5d3a
 </pre>
 
     <p>LLM 推理（小 batch）通常是 memory-bound——所有的工程套路（KV cache 优化、量化、PagedAttention）都为了减少访存。
@@ -365,8 +365,8 @@ graph LR
     B --> D["CUDA Graph cache<br/>各 batch_size 一份"]
     C --> E["attention / fused 算子"]
     D --> F["batch=1, 2, 4, 8, 16, 32"]
-    style C fill:#f6f8fa,stroke:#0969da
-    style D fill:#f6f8fa,stroke:#1a7f37
+    style C fill:#f3f1e8,stroke:#8b1538
+    style D fill:#f3f1e8,stroke:#2f5d3a
 </pre>
 
     <ul>

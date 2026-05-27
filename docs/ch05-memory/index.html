@@ -40,9 +40,9 @@ graph TD
     G["Global / HBM<br/>~500 cycles<br/>40-80 GB"]
     H["Host RAM<br/>~50000 cycles via PCIe"]
     R --> S --> L2 --> G --> H
-    style R fill:#f6f8fa,stroke:#1a7f37
-    style S fill:#f6f8fa,stroke:#0969da
-    style G fill:#f6f8fa,stroke:#bf8700
+    style R fill:#f3f1e8,stroke:#2f5d3a
+    style S fill:#f3f1e8,stroke:#8b1538
+    style G fill:#f3f1e8,stroke:#a86420
 </pre>
 
     <p>一句话总结："越靠上越快越小"。<strong>性能优化 = 让数据尽量待在上层</strong>。</p>
@@ -293,7 +293,7 @@ graph TD
     G["Global / HBM<br/>~500 cycles<br/>192 GB (B200)"]
     H["Host RAM<br/>~50000 cycles via PCIe / NVLink-C2C"]
     R --> T --> S --> L2 --> G --> H
-    style T fill:#f6f8fa,stroke:#bf8700
+    style T fill:#f3f1e8,stroke:#a86420
 </pre>
 
     <p>TMEM 的特殊性：</p>

@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 360" font-family="-apple-system, sans-serif">
   <style>
-    .lbl { fill:#1f2328; font-size:12px; }
-    .ttl { fill:#0550ae; font-size:14px; font-weight:600; }
-    .sub { fill:#6b7280; font-size:11px; }
-    .box { fill:#ffffff; stroke:#d0d7de; stroke-width:1; }
-    .core { fill:#f6f8fa; stroke:#1a7f37; stroke-width:1; }
-    .tc   { fill:#fff8c5; stroke:#bf8700; stroke-width:1.5; }
-    .mem  { fill:#ddf4ff; stroke:#0969da; stroke-width:1.5; }
+    .lbl  { fill:#2a2723; font-size:12px; }
+    .ttl  { fill:#8b1538; font-size:14px; font-weight:600; }
+    .sub  { fill:#807c75; font-size:11px; }
+    .box  { fill:#fbfaf6; stroke:#c2bea9; stroke-width:1; }
+    .core { fill:#f3f1e8; stroke:#2f5d3a; stroke-width:1; }
+    .tc   { fill:#f5ede0; stroke:#a86420; stroke-width:1.5; }
+    .mem  { fill:#e8eff5; stroke:#1a4d80; stroke-width:1.5; }
   </style>
 
   <rect x="10" y="10" width="700" height="340" class="box" rx="8"/>

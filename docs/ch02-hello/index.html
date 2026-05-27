@@ -67,8 +67,8 @@
 graph LR
     H["host = CPU<br/>跑 main()<br/>分配 / 准备数据"] -- cudaMemcpy --> D["device = GPU<br/>跑 kernel<br/>巨量并行计算"]
     D -- cudaMemcpy --> H
-    style H fill:#f6f8fa,stroke:#0969da
-    style D fill:#f6f8fa,stroke:#1a7f37
+    style H fill:#f3f1e8,stroke:#8b1538
+    style D fill:#f3f1e8,stroke:#2f5d3a
 </pre>
 
     <p>函数靠修饰符区分：</p>

@@ -51,8 +51,8 @@ graph TD
     Res2 --> LNF["final LayerNorm"]
     LNF --> Head["logits = h @ wte^T  (T, 50257)"]
     Head --> Smp["argmax / top-k / top-p → next token"]
-    style Loop fill:#f6f8fa,stroke:#0969da
-    style Attn fill:#f6f8fa,stroke:#bf8700
+    style Loop fill:#f3f1e8,stroke:#8b1538
+    style Attn fill:#f3f1e8,stroke:#a86420
 </pre>
 
     <table>
@@ -293,8 +293,8 @@ graph LR
     B --> P1["Prefill GPU pool<br/>(compute-bound, 大 batch)"]
     P1 -->|"KV 传输<br/>NVLink/IB"| D1["Decode GPU pool<br/>(memory-bound, 小 batch)"]
     D1 --> O["流式输出"]
-    style P1 fill:#f6f8fa,stroke:#0969da
-    style D1 fill:#f6f8fa,stroke:#1a7f37
+    style P1 fill:#f3f1e8,stroke:#8b1538
+    style D1 fill:#f3f1e8,stroke:#2f5d3a
 </pre>
 
     <p>主要工程实现：</p>

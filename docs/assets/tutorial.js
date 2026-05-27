@@ -66,22 +66,35 @@
     pre.appendChild(btn);
   });
 
-  // ---- 4. Mermaid init with matching light theme --------------------------
+  // ---- 4. Mermaid init: paper / book theme (matches Hermes Tutorial) ------
   if (window.mermaid) {
     window.mermaid.initialize({
       startOnLoad: true,
-      theme: 'default',
+      theme: 'neutral',
       themeVariables: {
-        background: '#ffffff',
-        primaryColor: '#f6f8fa',
-        primaryTextColor: '#1f2328',
-        primaryBorderColor: '#0969da',
-        lineColor: '#6b7280',
-        secondaryColor: '#ddf4ff',
-        tertiaryColor: '#f6f8fa',
-        fontFamily: '-apple-system, "PingFang SC", "Segoe UI", sans-serif',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Helvetica Neue", "PingFang SC", sans-serif',
+        fontSize: '14px',
+        primaryColor:        '#fbfaf6',
+        primaryTextColor:    '#2a2723',
+        primaryBorderColor:  '#8b1538',
+        lineColor:           '#4d4a44',
+        secondaryColor:      '#f3f1e8',
+        tertiaryColor:       '#e9e6d9',
+        background:          '#fbfaf6',
+        mainBkg:             '#fbfaf6',
+        secondBkg:           '#f3f1e8',
+        tertiaryTextColor:   '#2a2723',
+        nodeBorder:          '#c2bea9',
+        clusterBkg:          '#f6f4eb',
+        clusterBorder:       '#d6d3c4',
+        titleColor:          '#8b1538',
+        edgeLabelBackground: '#fbfaf6',
+        textColor:           '#2a2723',
+        noteBkgColor:        '#f5ede0',
+        noteBorderColor:     '#a86420',
+        noteTextColor:       '#2a2723',
       },
-      flowchart: { curve: 'basis' },
+      flowchart: { htmlLabels: true, curve: 'basis' },
     });
   }
 })();

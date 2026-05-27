@@ -51,8 +51,8 @@ graph TD
     B --> C["K 维分 BK=16 切片<br/>每片协作加载 128×16 + 16×128 到 shared"]
     C --> D["内层 K 循环 (BK=16):<br/>读 8 个 As 行 + 8 个 Bs 列 → 64 个 fmadd"]
     D --> E["写回 C"]
-    style B fill:#f6f8fa,stroke:#1a7f37
-    style D fill:#f6f8fa,stroke:#bf8700
+    style B fill:#f3f1e8,stroke:#2f5d3a
+    style D fill:#f3f1e8,stroke:#a86420
 </pre>
 
 <pre><code class="language-cpp">constexpr int BM = 128, BN = 128, BK = 16;
@@ -281,8 +281,8 @@ graph TD
     K1 -->|"否"| Dtype{"dtype 是 fp16 bf16 fp8 ?"}
     Dtype -->|"是"| TC["cublasGemmEx + TC<br/>或 CUTLASS"]
     Dtype -->|"否 fp32"| Sgemm["cublasSgemm"]
-    style GEMV fill:#f6f8fa,stroke:#bf8700
-    style TC fill:#f6f8fa,stroke:#1a7f37
+    style GEMV fill:#f3f1e8,stroke:#a86420
+    style TC fill:#f3f1e8,stroke:#2f5d3a
 </pre>
 
     <h3>9.9.5 LLM 各层 GEMM 的实际 shape</h3>
