@@ -70,6 +70,7 @@ desktop.ini
 .idea/
 *.swp
 *~
+.history/
 
 # Local server logs
 /tmp/srv.log

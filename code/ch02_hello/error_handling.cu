@@ -16,6 +16,8 @@
 #include <cstdio>
 
 __global__ void bad_kernel(int* p) {
+    // 空指针解引用
+    *(int*)0 = 0;
     // 故意越界写: p 只分配了 4 字节 (1 int)，但访问 1000000 号位置
     p[1000000] = 42;
 }
