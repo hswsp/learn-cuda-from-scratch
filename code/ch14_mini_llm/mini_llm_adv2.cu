@@ -201,7 +201,8 @@ constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
 __global__ void wmma_gemm_kernel(const __half* A, const __half* B, float* C,
                                  int M, int N, int K) {
     int warp_id = (threadIdx.y * blockDim.x + threadIdx.x) / 32;
-    int warp_m  = blockIdx.y * blockDim.y + warp_id / 2;
+    // block(32,4): 4 warps -> 2x2 个 16x16 tile -> 32x32 输出块
+    int warp_m  = blockIdx.y * 2 + warp_id / 2;
     int warp_n  = blockIdx.x * 2 + warp_id % 2;
 
     int row0 = warp_m * WMMA_M;
@@ -244,7 +245,7 @@ __global__ void simple_gemm_kernel(const float* A, const __half* B, float* C,
 //   - blockIdx.x = Q tile id
 //   - Q/K/V/O 的跨行步长为 head_stride = n_head * D_head
 // 固定 Dm = 64（与 GPT-2 small head_dim 匹配）。
-constexpr int Br = 64, Bc = 64, Dm = 64;
+constexpr int Br = 32, Bc = 32, Dm = 64;  // 共享内存控制在 ~36KB，适配 T4/sm_75
 
 __global__ void flash_attn_v1_kernel(const float* qkv, float* attn_out,
                                      int T, int n_head, float scale, bool causal) {

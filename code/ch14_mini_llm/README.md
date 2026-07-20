@@ -59,6 +59,7 @@ make mini_llm_adv1
    - 仅当 `N/K` 未 16 对齐时才回退到简单 GEMM。
 3. **FlashAttention**：prefill 阶段用 Ch12 的 `flash_attn_v1` 替换朴素 attention，
    不物化 `T×T` 中间矩阵；decode 阶段使用单 query 的 KV-cache attention。
+   为适配 Colab T4 的 48KB 共享内存上限，FA tile 调整为 `Br=32, Bc=32`。
 
 预期性能（A100 fp16, prompt=4）：单步约 5 ms（v1 约 50 ms）。
 
